@@ -8,7 +8,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ValidationError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -432,6 +432,239 @@ Examples:
         sys.exit(130)
 
 
+def _add_provider_command(argv: list[str]) -> None:
+    """Handle `cswap add-provider --provider … [auth flags]`.
+
+    Registers a third-party provider configuration (Amazon Bedrock, Bedrock/
+    Mantle, Google Vertex, Microsoft Foundry) as a managed slot. Pre-dispatched
+    before the main parser for the same reason as `alias`: it carries its own
+    flag set, which the main parser's mutually-exclusive group cannot hold.
+
+    `cswap add` captures a provider configuration that is already live in
+    settings.json; this is the headless spelling, for a machine where it isn't
+    set up yet or where the values come from elsewhere.
+    """
+    from claude_swap import provider
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} add-provider",
+        description=(
+            "Register a third-party provider configuration as a managed "
+            "account. Activating it writes the provider's environment "
+            "variables into Claude Code's settings.json — the same keys "
+            "/setup-bedrock writes — so it becomes your default login for "
+            "the CLI, the VS Code extension, and every terminal.\n\n"
+            "If the provider is already configured on this machine, "
+            "'cswap add' captures it as-is instead."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap add-provider --provider bedrock --region us-east-1 --bearer-token -
+  cswap add-provider --provider mantle --region us-east-1 --bearer-token
+  cswap add-provider --provider bedrock --region eu-west-1 --profile my-sso
+  cswap add-provider --provider bedrock --region us-east-1 --environment
+  cswap add-provider --provider vertex --set ANTHROPIC_VERTEX_PROJECT_ID=my-proj
+
+Secrets are read from a prompt (or stdin with '-') rather than argv, so they
+stay out of your shell history.
+        """,
+    )
+    parser.add_argument(
+        "--provider",
+        required=True,
+        metavar="NAME",
+        help=(
+            "Which provider: bedrock, mantle, vertex, foundry, anthropic-aws, "
+            "anthropic-google-cloud"
+        ),
+    )
+    parser.add_argument(
+        "--region",
+        metavar="REGION",
+        help="Region/location for the provider (e.g. us-east-1)",
+    )
+    auth = parser.add_mutually_exclusive_group()
+    auth.add_argument(
+        "--bearer-token",
+        nargs="?",
+        const="",
+        metavar="TOKEN|-",
+        help=(
+            "Bedrock API key (AWS_BEARER_TOKEN_BEDROCK). Pass '-' to read one "
+            "line from stdin, or no value to be prompted securely"
+        ),
+    )
+    auth.add_argument(
+        "--profile",
+        metavar="NAME",
+        help="Named AWS profile to authenticate with (AWS_PROFILE)",
+    )
+    auth.add_argument(
+        "--access-key-id",
+        metavar="ID",
+        help="Static AWS access key id (requires --secret-access-key)",
+    )
+    auth.add_argument(
+        "--environment",
+        action="store_true",
+        help=(
+            "Use the ambient credentials already in the environment (AWS "
+            "provider chain, SSO, instance role, gcloud ADC) — nothing stored"
+        ),
+    )
+    parser.add_argument(
+        "--secret-access-key",
+        nargs="?",
+        const="",
+        metavar="KEY|-",
+        help=(
+            "Static AWS secret access key. Pass '-' to read one line from "
+            "stdin, or no value to be prompted securely"
+        ),
+    )
+    parser.add_argument(
+        "--session-token",
+        nargs="?",
+        const="",
+        metavar="TOKEN|-",
+        help="Optional AWS session token for temporary static credentials",
+    )
+    for tier in provider.MODEL_PIN_KEYS:
+        parser.add_argument(
+            f"--pin-{tier}",
+            metavar="MODEL_ID",
+            help=f"Pin the {tier} tier to a provider model id",
+        )
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        dest="env_assignments",
+        help=(
+            "Set an additional provider variable (repeatable), e.g. "
+            "--set ANTHROPIC_CUSTOM_HEADERS='anthropic-workspace-id: proj_x'"
+        ),
+    )
+    parser.add_argument(
+        "--email",
+        metavar="EMAIL",
+        help=(
+            "Label for the account. Defaults to <provider>-{slot}@provider.local, "
+            "since a provider configuration carries no email"
+        ),
+    )
+    parser.add_argument("--slot", type=int, metavar="NUM", help="Slot number to use")
+    parser.add_argument(
+        "--alias", metavar="NAME", help="Short display alias for the account"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        provider_name = provider.normalize_provider(args.provider)
+        spec = provider.PROVIDERS[provider_name]
+
+        # Resolve the auth method from which flag was given. A provider with no
+        # AWS auth axis (Vertex/Foundry) only ever has ambient credentials.
+        if not spec.aws:
+            if args.bearer_token is not None or args.profile or args.access_key_id:
+                parser.error(
+                    f"{spec.label} authenticates through its own ambient "
+                    "credentials; pass provider-specific values with --set "
+                    "instead of an AWS auth flag."
+                )
+            auth_method = "environment"
+        elif args.bearer_token is not None:
+            auth_method = "bearer"
+        elif args.profile:
+            auth_method = "profile"
+        elif args.access_key_id:
+            auth_method = "accessKey"
+        elif args.environment:
+            auth_method = "environment"
+        else:
+            parser.error(
+                "choose how to authenticate: --bearer-token, --profile, "
+                "--access-key-id (with --secret-access-key), or --environment"
+            )
+
+        bearer = (
+            _read_secret(args.bearer_token, "Bedrock API key: ")
+            if auth_method == "bearer"
+            else ""
+        )
+        secret_key = ""
+        session_token = ""
+        if auth_method == "accessKey":
+            if args.secret_access_key is None:
+                parser.error("--access-key-id requires --secret-access-key")
+            secret_key = _read_secret(args.secret_access_key, "Secret access key: ")
+            if args.session_token is not None:
+                session_token = _read_secret(args.session_token, "Session token: ")
+        elif args.secret_access_key is not None or args.session_token is not None:
+            parser.error(
+                "--secret-access-key/--session-token apply to --access-key-id only"
+            )
+
+        env: dict[str, str] = {}
+        for assignment in args.env_assignments:
+            key, value = provider.parse_env_assignment(assignment)
+            env[key] = value
+
+        config = provider.parse_provider_config({
+            "provider": provider_name,
+            "authMethod": auth_method,
+            "region": args.region or "",
+            "bearerToken": bearer,
+            "awsProfile": args.profile or "",
+            "accessKeyId": args.access_key_id or "",
+            "secretAccessKey": secret_key,
+            "sessionToken": session_token,
+            "env": env,
+            "modelPins": {
+                tier: getattr(args, f"pin_{tier}")
+                for tier in provider.MODEL_PIN_KEYS
+                if getattr(args, f"pin_{tier}")
+            },
+        })
+
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        written = switcher.add_provider_account(
+            config, email=args.email, slot=args.slot, alias=args.alias
+        )
+        if written is not None:
+            print(dimmed(f"Activate it with: {_prog_name()} switch {written}"))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _read_secret(value: str, prompt: str) -> str:
+    """Resolve a secret flag value: ``-`` reads stdin, ``""`` prompts.
+
+    Same contract as ``--add-token``: a secret should not have to appear in
+    argv (and so in shell history), so an empty value prompts via getpass and
+    ``-`` reads one line from stdin for scripted use. A value passed inline is
+    still honored — some callers legitimately have it in an env var already.
+    """
+    import getpass
+
+    if value == "-":
+        value = sys.stdin.readline().rstrip("\n")
+    elif not value:
+        value = getpass.getpass(prompt)
+    value = value.strip()
+    if not value:
+        raise ValidationError("Secret cannot be empty")
+    return value
+
+
 def _alias_command(argv: list[str]) -> None:
     """Handle `cswap alias [NUM|EMAIL] [NAME] [--unset]`.
 
@@ -594,6 +827,16 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Allow switching onto managed API-key accounts as a last resort "
             "(they bill per token; default: excluded)"
+        ),
+    )
+    parser.add_argument(
+        "--include-provider-accounts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Allow switching onto third-party provider accounts (Bedrock, "
+            "Vertex, Foundry) as a last resort (they bill through your cloud "
+            "account; default: excluded)"
         ),
     )
     parser.add_argument(
@@ -884,6 +1127,9 @@ def main() -> None:
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
         return
+    if argv and argv[0] == "add-provider":
+        _add_provider_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -915,6 +1161,7 @@ Commands:
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
+  %(prog)s add-provider --provider …  register a Bedrock/Vertex/Foundry config
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
   %(prog)s enable <num|email>         return a disabled account to rotation
@@ -948,6 +1195,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
+  %(prog)s add-provider --provider bedrock --region us-east-1 --bearer-token
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80

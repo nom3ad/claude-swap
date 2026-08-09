@@ -49,6 +49,11 @@ class AutoSwitchSettings:
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
+    # Third-party provider accounts (Bedrock/Mantle/Vertex/Foundry) bill through
+    # the cloud account and report no quota, so they are held out of automatic
+    # rotation by default for the same reason API-key accounts are: an unattended
+    # failover must not start spending money the user didn't budget.
+    include_provider_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
@@ -126,6 +131,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
+        ),
+        SettingSpec(
+            "autoswitch", "includeProviderAccounts", "include_provider_accounts", "bool",
+            help="Allow rotating onto third-party provider accounts (bill per token)",
         ),
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
@@ -429,6 +438,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
+        ("include_provider_accounts", "include_provider_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
     ):

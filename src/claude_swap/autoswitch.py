@@ -673,6 +673,28 @@ class AutoSwitchEngine:
             return {}
         return raw if isinstance(raw, dict) else {}
 
+    # -- metered accounts -----------------------------------------------------
+    #
+    # Managed API keys and third-party provider accounts (Bedrock/Mantle/Vertex/
+    # Foundry) share every property the engine cares about: they report no quota
+    # to compare, they bill per token rather than against a subscription window,
+    # and neither has a refresh token to freshen. Both are therefore held out of
+    # automatic rotation unless the user opts that kind in — an unattended
+    # failover must not silently start spending money.
+
+    def _is_metered(self, number: str) -> bool:
+        """Whether a slot bills per token instead of against a quota window."""
+        return self.switcher.account_kind_for(number) in ClaudeAccountSwitcher.METERED_KINDS
+
+    def _metered_opted_in(self, number: str, settings: AutoSwitchSettings) -> bool:
+        """Whether the user opted this metered slot into automatic rotation."""
+        kind = self.switcher.account_kind_for(number)
+        if kind == "api_key":
+            return settings.include_api_key_accounts
+        if kind == "provider":
+            return settings.include_provider_accounts
+        return True
+
     def _mutate_state(self, mutator: Callable[[dict], None]) -> dict:
         """Read-modify-write the state file under its lock; returns new state.
 
@@ -753,8 +775,10 @@ class AutoSwitchEngine:
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
-        if self.switcher.account_kind_for(number) == "api_key":
-            return "ok"  # API keys don't expire/refresh
+        if self._is_metered(number):
+            # Neither an API key nor a provider config has a refresh token:
+            # there is nothing to freshen, and both activate as they are.
+            return "ok"
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
             # profile. Auto-activating it as the default login too would put
@@ -924,14 +948,16 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (
-            self.switcher.account_kind_for(current) == "api_key"
-            and not settings.include_api_key_accounts
-        ):
+        if self._is_metered(current) and not self._metered_opted_in(current, settings):
+            is_api_key = self.switcher.account_kind_for(current) == "api_key"
             self._emit(
                 NoSwitchEvent(
-                    reason="active-api-key",
-                    detail="API-key accounts have no quota to watch",
+                    reason="active-api-key" if is_api_key else "active-provider",
+                    detail=(
+                        "API-key accounts have no quota to watch"
+                        if is_api_key
+                        else "third-party provider accounts have no quota to watch"
+                    ),
                 )
             )
             return TickOutcome.NO_ACTION
@@ -1020,18 +1046,21 @@ class AutoSwitchEngine:
             for num in self.switcher.switchable_account_numbers()
             if num != current and num not in quarantined
         ]
-        oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
-        ]
+        oauth_candidates = [n for n in candidates if not self._is_metered(n)]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
         # in this census of what exists. See `_no_return_account` for the
         # incident, the scoping, and the release.
-        api_key_candidates = (
-            [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
-            if settings.include_api_key_accounts
-            else []
-        )
+        #
+        # Metered candidates (API-key and third-party provider slots) are a
+        # last resort with no measurable headroom, and each kind is gated by its
+        # own opt-in — so a user who allows API-key failover does not silently
+        # get Bedrock failover too.
+        metered_candidates = [
+            n
+            for n in candidates
+            if self._is_metered(n) and self._metered_opted_in(n, settings)
+        ]
         if (
             trigger == "consume-first"
             and not oauth_candidates
@@ -1039,7 +1068,7 @@ class AutoSwitchEngine:
         ):
             # Healthy below-threshold account with no OAuth peer to compare
             # against — the same state `best` reports as below-threshold
-            # NO_ACTION before ever reaching candidate selection. API-key
+            # NO_ACTION before ever reaching candidate selection. Metered
             # candidates don't change the outcome: they have no weekly window
             # to consume, so a consume-first nudge never targets them. Keep
             # the exit-code contract identical across strategies: cron
@@ -1055,7 +1084,7 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        if not oauth_candidates and not api_key_candidates:
+        if not oauth_candidates and not metered_candidates:
             # Won't change until the user adds/recovers an account — no point
             # re-polling at full cadence.
             self._blocked_wait_long = True
@@ -1181,11 +1210,12 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
-            # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
-            ordered = api_key_candidates
+        if not ordered and metered_candidates and trigger != "consume-first":
+            # Last resort when we must move: metered accounts — API keys and
+            # third-party providers (unmeasurable headroom). Never for a
+            # below-threshold consume-first nudge, since neither has a weekly
+            # window to consume.
+            ordered = metered_candidates
 
         if not ordered:
             if not any_known:
@@ -2144,8 +2174,7 @@ class AutoSwitchEngine:
         relevant = [
             n
             for n in self.switcher.switchable_account_numbers()
-            if n not in quarantined
-            and self.switcher.account_kind_for(n) != "api_key"
+            if n not in quarantined and not self._is_metered(n)
         ]
         values = [usage.get(n) for n in relevant]
         readable = [v for v in values if isinstance(v, dict)]

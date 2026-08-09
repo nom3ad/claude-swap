@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.settings import SETTING_SPECS
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -46,12 +47,15 @@ class TestConfigList:
             "autoswitch.hysteresisPct",
             "autoswitch.strategy",
             "autoswitch.includeApiKeyAccounts",
+            "autoswitch.includeProviderAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        # Every registered key, none of them set — derived from the registry so
+        # adding a setting doesn't need this number hand-updated.
+        assert out.count("(default)") == len(SETTING_SPECS)
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,10 +82,11 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert set(by_key) == set(SETTING_SPECS)
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
+        assert by_key["autoswitch.includeProviderAccounts"]["value"] is False
 
 
 class TestConfigSetGet:

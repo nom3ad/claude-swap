@@ -99,7 +99,7 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
-- An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
+- An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). Metered accounts are never rotated onto unless you opt them in: API-key accounts with `--include-api-key-accounts`, third-party provider accounts (Bedrock/Vertex/Foundry) with `--include-provider-accounts`.
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
@@ -221,7 +221,9 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root, alongside `active-provider.json` when a third-party provider account is active (it just records which slot the live provider config came from).
+
+Third-party provider accounts are the exception to the table above: their configuration is not a credential but the `env` block of Claude Code's own `~/.claude/settings.json`, which is where activating one writes (the stored copy still lives in the credential store, since a bearer token or access key is secret material).
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -340,6 +342,85 @@ cswap add-token --email user@example.com     # optional label override
 setup-token. It switches like any other account; since API keys have no subscription
 quota, they show no usage and the usage-aware `switch` strategies never skip them as
 rate-limited.
+
+### Third-party providers (Bedrock, Vertex, Foundry)
+
+Claude Code can also run against a third-party provider — Amazon Bedrock (including
+the Mantle flavor), Google Vertex AI, Microsoft Foundry, or the Claude Platform on
+AWS/Google Cloud. Those don't use a Claude login at all: the whole configuration is
+environment variables, which is what `/setup-bedrock` writes into
+`~/.claude/settings.json`. claude-swap can manage such a configuration as a numbered
+slot, so you can switch between your Claude subscription and your cloud account the
+same way you switch between two subscriptions.
+
+If the provider is already set up on this machine, just capture it:
+
+```bash
+cswap add          # captures the live provider config from settings.json
+```
+
+On a Bedrock machine you usually run `cswap add` twice: the first call registers the
+provider (it's the live login), the second registers the dormant Claude login
+underneath it. Or configure one from scratch:
+
+```bash
+cswap add-provider --provider bedrock --region us-east-1 --bearer-token
+cswap add-provider --provider mantle  --region us-east-1 --bearer-token -   # from stdin
+cswap add-provider --provider bedrock --region eu-west-1 --profile my-sso
+cswap add-provider --provider bedrock --region us-west-2 \
+    --access-key-id AKIA... --secret-access-key
+cswap add-provider --provider bedrock --region us-east-1 --environment
+cswap add-provider --provider vertex --set ANTHROPIC_VERTEX_PROJECT_ID=my-proj
+```
+
+All four `/setup-bedrock` auth methods are supported — a Bedrock API key
+(`--bearer-token`), a named AWS profile including SSO (`--profile`), static access
+keys (`--access-key-id`/`--secret-access-key`, optionally `--session-token`), and
+`--environment` to use whatever the AWS credential chain already resolves. Secrets
+are read from a prompt, or from stdin with `-`, so they stay out of your shell
+history. `--set KEY=VALUE` carries extra provider variables (e.g.
+`ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_BEDROCK_SERVICE_TIER`) and
+`--pin-opus`/`--pin-sonnet`/`--pin-haiku`/`--pin-fable` pin a tier to a provider
+model id. Then switch as usual: `cswap switch 3`.
+
+<details>
+<summary>How it behaves & limitations</summary>
+
+- **What activation changes.** Switching to a provider account writes its variables
+  into the `env` block of `~/.claude/settings.json` — the same keys `/setup-bedrock`
+  writes — and removes every provider variable claude-swap manages that the new
+  account doesn't need, so a leftover key can never shadow the account you just
+  activated. Everything else in `settings.json` (your other settings and any env
+  vars claude-swap doesn't manage) is left untouched, and a symlinked
+  `settings.json` is written *through*, not replaced.
+- **Restart to pick it up.** Claude Code reads `settings.json` at startup, so unlike
+  a credential switch this one needs a restart (or reopening the VS Code extension
+  tab). An exported provider variable in your shell still wins over settings.json —
+  if you have `CLAUDE_CODE_USE_BEDROCK` or `AWS_BEARER_TOKEN_BEDROCK` in your
+  shell profile, remove it or claude-swap's switching won't be visible.
+- **Your Claude login is kept.** Activating a provider doesn't delete the OAuth
+  credential underneath — it's simply dormant while a provider is configured — so
+  switching back needs no re-login.
+- **No usage numbers.** These accounts bill through your cloud account and expose no
+  quota endpoint, so they show "no quota" instead of usage bars, and auto-switch
+  never rotates onto one unless you pass `--include-provider-accounts` (or set
+  `cswap config set autoswitch.includeProviderAccounts true`).
+- **Not supported in session mode.** `cswap run N` rejects a provider slot: its
+  configuration lives in `settings.json`, which a session profile shares rather
+  than isolates, so a per-terminal provider would leak into every other terminal.
+  For the same reason, running a *subscription* account with `cswap run` while a
+  provider is your default login warns you: settings.json wins over the
+  environment, so that session would run against the provider anyway. Switch to a
+  subscription account first, or use `cswap run N --no-share`.
+- **Exports contain the secret.** Unlike an OAuth blob there is nothing separable to
+  strip, so exporting a `--bearer-token` or access-key account carries its secret in
+  cleartext (`--profile` and `--environment` accounts carry none). The export
+  envelope has never been encrypted — protect or delete it accordingly.
+- Hand-editing the managed variables in `settings.json` is fine, but the next switch
+  rewrites them from the stored config; run `cswap add --slot N` to capture your
+  edit instead.
+
+</details>
 
 ## Uninstall
 

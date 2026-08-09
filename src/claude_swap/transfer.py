@@ -14,9 +14,10 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__
+from claude_swap import __version__, provider
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     TransferError,
@@ -154,7 +155,15 @@ def _slim_credentials(creds_obj: dict) -> dict:
     secret surface with no cross-machine value. Legacy shapes without
     ``claudeAiOauth`` export verbatim; ``--full`` (same-PC backup) skips
     this and keeps the whole blob.
+
+    A third-party provider config passes through verbatim: every field is
+    load-bearing for activation, so there is nothing separable to drop. Note
+    the security consequence — a ``bearer`` or ``accessKey`` provider account
+    carries its secret into the export even without ``--full``, because that
+    secret *is* the account (see the export docstring).
     """
+    if provider.looks_like_provider_config(json.dumps(creds_obj)):
+        return creds_obj
     if "claudeAiOauth" not in creds_obj:
         return creds_obj
     return {"claudeAiOauth": creds_obj["claudeAiOauth"]}
@@ -176,6 +185,13 @@ def export_accounts(
             entire credential object per account (same-PC backup). Default
             False writes only oauthAccount and the account's own
             claudeAiOauth login.
+
+    Third-party provider accounts are exported in full regardless of ``full``:
+    every field of a provider config is needed to activate it, so a ``bearer``
+    or ``accessKey`` account's **secret travels in the export**. (``profile`` and
+    ``environment`` accounts carry no secret — they name ambient AWS credentials
+    that stay on each machine.) The envelope has never been encrypted; this
+    makes protecting it matter more, not differently.
 
     Raises:
         TransferError: malformed/missing data, unknown account.
@@ -252,6 +268,7 @@ def export_accounts(
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
         is_api_key = looks_like_api_key(creds_text)
+        is_provider = provider.looks_like_provider_config(creds_text)
         if is_api_key:
             creds_payload: Any = creds_text.strip()
         else:
@@ -270,6 +287,8 @@ def export_accounts(
         }
         if is_api_key:
             entry["kind"] = "api_key"
+        elif is_provider:
+            entry["kind"] = "provider"
         if record.get("alias"):
             entry["alias"] = record["alias"]
         accounts_payload.append(entry)
@@ -382,15 +401,31 @@ def import_accounts(
         config_obj = raw.get("config")
         if not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
-        # API-key accounts carry the credential as a raw string; OAuth accounts
-        # carry a JSON object.
+        # API-key accounts carry the credential as a raw string; OAuth and
+        # third-party provider accounts carry a JSON object (told apart by the
+        # declared kind, falling back to the payload's own shape for an export
+        # written before the kind existed).
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        is_provider = raw.get("kind") == "provider" or (
+            raw.get("kind") is None
+            and provider.looks_like_provider_config(json.dumps(creds_obj))
+        )
         if is_api_key:
             if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
                 raise TransferError(
                     f"API-key credentials for {email} must be a raw sk-ant-api… string"
                 )
             creds_text = creds_obj.strip()
+        elif is_provider:
+            # Validate through the one provider validator, so a hand-edited or
+            # future-version export is rejected here rather than at switch time.
+            try:
+                config = provider.parse_provider_config(
+                    creds_obj, label=f"provider credentials for {email}"
+                )
+            except ClaudeSwitchError as e:
+                raise TransferError(str(e)) from e
+            creds_text = config.to_json()
         else:
             if not isinstance(creds_obj, dict):
                 raise TransferError(
@@ -428,7 +463,9 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
-                "kind": "api_key" if is_api_key else "oauth",
+                "kind": (
+                    "api_key" if is_api_key else "provider" if is_provider else "oauth"
+                ),
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
@@ -548,8 +585,8 @@ def import_accounts(
             "organizationName": entry["org_name"],
             "added": entry["added"],
         }
-        if entry["kind"] == "api_key":
-            new_record["kind"] = "api_key"
+        if entry["kind"] in ("api_key", "provider"):
+            new_record["kind"] = entry["kind"]
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
         data["accounts"][target_num] = new_record

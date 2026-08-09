@@ -426,7 +426,7 @@ class SessionManager:
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
-        self._ensure_not_api_key(account_num, email)
+        self._ensure_switchable_kind(account_num, email)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir_preset:
@@ -458,6 +458,8 @@ class SessionManager:
                 f"Ignoring {', '.join(scrubbed)} for this session — it would "
                 f"override the selected account inside Claude Code."
             )
+
+        self._warn_provider_block_overrides_session()
 
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
@@ -507,18 +509,67 @@ class SessionManager:
         os.execvpe(claude_bin, argv, env)
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _ensure_not_api_key(self, account_num: str, email: str) -> None:
-        """Reject API-key accounts in session mode (not supported yet).
+    def _warn_provider_block_overrides_session(self) -> None:
+        """Warn when a live provider config will outrank the session's account.
+
+        A third-party provider is configured in ``settings.json``'s ``env``, and
+        claude applies that over the process environment — while sharing
+        *symlinks* the user's own ``settings.json`` into the profile. So a
+        session launched while a provider account is the default login runs
+        against that provider, billing the cloud account, no matter which
+        account's credential the profile holds. ``CLAUDE_CONFIG_DIR`` cannot
+        isolate this: the block is inside the file being shared.
+
+        Warn rather than block: the user asked for this account, running it
+        against the provider still works, and refusing would strand
+        ``cswap run`` for anyone whose default login is a provider. Best-effort
+        — a warning must never fail a launch.
+        """
+        try:
+            from claude_swap import provider
+
+            config = provider.live_provider_config()
+        except Exception:  # pragma: no cover - defensive; never block a launch
+            return
+        if config is None:
+            return
+        warning(
+            f"Your default login is a {config.label} configuration, which "
+            "Claude Code reads from settings.json — and settings.json wins "
+            "over the environment. This session will run against that "
+            "provider (billed to your cloud account), not this account's "
+            "subscription. Switch to a subscription account first "
+            "('cswap switch <num|email>'), or launch with --no-share so the "
+            "profile does not inherit settings.json."
+        )
+
+    def _ensure_switchable_kind(self, account_num: str, email: str) -> None:
+        """Reject non-OAuth account kinds in session mode (not supported yet).
 
         Session bootstrap is OAuth-shaped — it seeds ``.credentials.json`` and
-        ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so an API-key
-        account would otherwise fail validation opaquely. Raise early with guidance.
+        ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so an
+        API-key account would otherwise fail validation opaquely. A third-party
+        provider account fails for a further reason: its configuration is
+        environment, not a credential, and ``CLAUDE_CONFIG_DIR`` does not isolate
+        the ``settings.json`` env block that carries it (sharing symlinks the
+        user's own settings.json into the profile), so a per-session provider
+        would leak into every other terminal. Raise early with guidance.
         """
-        if self.switcher._account_kind(account_num) == "api_key":
+        kind = self.switcher._account_kind(account_num)
+        if kind == "api_key":
             raise SessionError(
                 f"Account-{account_num} ({email}) is an API-key account; "
                 "'cswap run' (session mode) does not support API-key accounts yet. "
                 "Use 'cswap --switch-to' to make it your default login instead."
+            )
+        if kind == "provider":
+            raise SessionError(
+                f"Account-{account_num} ({email}) is a third-party provider "
+                "account; 'cswap run' (session mode) does not support provider "
+                "accounts — their configuration lives in settings.json, which a "
+                "session profile shares rather than isolates. Use "
+                f"'cswap switch {account_num}' to make it your default login "
+                "instead."
             )
 
     # -- bootstrap -------------------------------------------------------
@@ -529,7 +580,7 @@ class SessionManager:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
-        self._ensure_not_api_key(account_num, email)
+        self._ensure_switchable_kind(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
 
         # Deferred invalidation: backup credentials changed while this profile

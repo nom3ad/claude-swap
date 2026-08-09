@@ -23,7 +23,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, provider
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -31,6 +31,7 @@ from claude_swap.json_output import (
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_PROVIDER,
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
@@ -164,6 +165,7 @@ SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
+    USAGE_PROVIDER: "third-party provider (billed by your cloud account, no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
 }
@@ -198,7 +200,10 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
-        if last_seen is not None and entry.sentinel != USAGE_API_KEY:
+        if last_seen is not None and entry.sentinel not in (
+            USAGE_API_KEY,
+            USAGE_PROVIDER,
+        ):
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
     if entry.last_good is not None:
@@ -1646,7 +1651,8 @@ class ClaudeAccountSwitcher:
             print(dimmed("  It is back in the rotation."))
 
     def account_kind_for(self, account_num: str) -> str:
-        """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
+        """Public wrapper: ``"api_key"``, ``"provider"``, or ``"oauth"``
+        (setup-tokens read as oauth)."""
         return self._account_kind(account_num)
 
     def account_email(self, account_num: str) -> str:
@@ -1663,17 +1669,28 @@ class ClaudeAccountSwitcher:
         overwrite a login cswap doesn't own (``_perform_switch`` would take
         the no-backup direct-activation path). Use :meth:`has_live_login` to
         tell the two ``None`` cases apart.
+
+        A live third-party provider block wins over ``oauthAccount`` here for
+        the same reason as in ``_build_accounts_info``: it is the credential
+        claude actually uses.
         """
+        data = self._get_sequence_data() or {}
+        provider_slot = self.active_provider_slot(data)
+        if provider_slot is not None:
+            return provider_slot
         identity = self._get_current_account()
         if identity is None:
             return None
-        data = self._get_sequence_data() or {}
         email, org_uuid = identity
         return self._find_account_slot(data, email, org_uuid)
 
     def has_live_login(self) -> bool:
-        """Whether ``~/.claude.json`` carries any live account identity."""
-        return self._get_current_account() is not None
+        """Whether the environment carries any live account identity —
+        an ``oauthAccount`` in ``~/.claude.json`` or a provider env block."""
+        return (
+            self._get_current_account() is not None
+            or bool(provider.read_live_block())
+        )
 
     def live_session_pids_for(self, account_num: str, email: str) -> list[int]:
         """Public wrapper: PIDs of live ``cswap run`` sessions for a slot."""
@@ -1999,17 +2016,107 @@ class ClaudeAccountSwitcher:
             return False
         return self._find_account_slot(data, email, organization_uuid) is not None
 
-    def _account_kind(self, account_num: str | None) -> str:
-        """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
+    #: Account kinds whose usage is metered by the token rather than covered by
+    #: a subscription window: a managed API key bills against Anthropic credit,
+    #: a third-party provider against the cloud account. Neither exposes a quota
+    #: to compare, so automatic rotation never lands on one unless the user opts
+    #: in (see ``autoswitch.includeApiKeyAccounts`` /
+    #: ``autoswitch.includeProviderAccounts``).
+    METERED_KINDS = frozenset({"api_key", "provider"})
 
-        Slots added before this field existed have no ``kind`` and read as
-        ``"oauth"`` (back-compat).
+    def _account_kind(self, account_num: str | None) -> str:
+        """Stored kind for a managed slot.
+
+        ``"api_key"`` (a managed ``sk-ant-api…`` key), ``"provider"`` (a
+        third-party provider config — Bedrock/Mantle/Vertex/Foundry), or
+        ``"oauth"`` (default). Slots added before this field existed have no
+        ``kind`` and read as ``"oauth"`` (back-compat), and so does any
+        unrecognized value — a newer cswap's kind must degrade to the
+        credential-shaped path rather than to a silent misclassification.
         """
         if account_num is None:
             return "oauth"
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num), {})
-        return "api_key" if record.get("kind") == "api_key" else "oauth"
+        kind = record.get("kind")
+        return kind if kind in ("api_key", "provider") else "oauth"
+
+    # -- third-party provider accounts -----------------------------------
+    #
+    # A provider slot's material is an env block, not a credential: activation
+    # writes ``settings.json``'s ``env`` (see ``claude_swap.provider``) and the
+    # credential store merely *stores* the config. Two consequences the rest of
+    # the switcher has to respect:
+    #
+    # - The live credential store says nothing about a provider account. A
+    #   provider slot ALWAYS reads its backup, even when active, or it would
+    #   report the dormant OAuth login left behind by the account switched away
+    #   from.
+    # - ``~/.claude.json``'s ``oauthAccount`` also says nothing: a provider
+    #   config neither writes nor clears it, so the stale identity of the
+    #   previous login survives. Active-slot detection therefore consults the
+    #   live env block FIRST and only falls back to ``oauthAccount``.
+
+    def _provider_config_for(self, account_num: str, email: str):
+        """A slot's stored provider config, or ``None`` when it has none.
+
+        Tolerant by design — a slot whose stored config is missing or malformed
+        reports ``None`` rather than raising, so a hand-broken backup degrades
+        to "not activatable" (which ``_account_is_switchable`` already reports)
+        instead of breaking every list render.
+        """
+        creds = self._read_account_credentials(str(account_num), email)
+        if not provider.looks_like_provider_config(creds):
+            return None
+        try:
+            return provider.parse_provider_config(creds)
+        except ValidationError as e:
+            self._logger.warning(
+                "Account %s has an unusable provider config: %s", account_num, e
+            )
+            return None
+
+    def _provider_slot_blocks(self, data: dict | None = None) -> dict[str, dict[str, str]]:
+        """Env block per provider slot, keyed by slot number.
+
+        Reads only slots recorded as ``kind: "provider"``, so an install with no
+        provider accounts does no extra credential I/O at all.
+        """
+        data = data if data is not None else (self._get_sequence_data() or {})
+        blocks: dict[str, dict[str, str]] = {}
+        for num, record in (data.get("accounts") or {}).items():
+            if record.get("kind") != "provider":
+                continue
+            config = self._provider_config_for(str(num), record.get("email", ""))
+            if config is not None:
+                blocks[str(num)] = provider.env_block_for(config)
+        return blocks
+
+    def active_provider_slot(self, data: dict | None = None) -> str | None:
+        """The provider slot the live ``settings.json`` activates, if any.
+
+        ``None`` covers three distinct situations that all mean "no managed
+        provider account is the live login": no provider env block at all
+        (a first-party login), or a block that belongs to no managed slot
+        (configured by hand or by ``/setup-bedrock``, which ``cswap add``
+        can capture).
+
+        Cheap in the common case: one small file read that returns ``{}`` and
+        short-circuits before any credential store access.
+        """
+        live = provider.read_live_block()
+        if not live:
+            return None
+        data = data if data is not None else (self._get_sequence_data() or {})
+        return provider.resolve_active_slot(
+            live,
+            self._provider_slot_blocks(data),
+            provider.read_marker(self.backup_dir),
+        )
+
+    def live_provider_config(self):
+        """The provider config the live environment runs as, or ``None``."""
+        return provider.live_provider_config()
 
     def _reject_live_api_key_capture(self, creds: str) -> None:
         """Guard for ``add_account``: never capture a live managed key as OAuth.
@@ -2026,16 +2133,23 @@ class ClaudeAccountSwitcher:
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
             )
 
-    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
-        """Reject registering a token whose (email, personal-org) already exists as
-        the *other* kind.
+    #: Human labels for the kinds, for the cross-kind collision message.
+    _KIND_LABELS = {
+        "api_key": "API-key",
+        "provider": "third-party provider",
+        "oauth": "OAuth",
+    }
+
+    def _reject_cross_kind_collision(self, email: str, new_kind: str) -> None:
+        """Reject registering an account whose (email, personal-org) already
+        exists as a *different* kind.
 
         Identity is matched on ``(email, organizationUuid)`` only, so two slots
-        sharing an email across kinds (one OAuth, one API key) could not be told
+        sharing an email across kinds (say one OAuth, one API key) could not be told
         apart at switch time. Rather than thread ``kind`` through the whole identity
         system, refuse the collision and point the user at a distinct ``--email``.
-        The default ``…@token.local`` labels never collide; this only guards a forced
-        ``--email``.
+        The default ``…@token.local`` / ``…@provider.local`` labels never collide;
+        this only guards a forced ``--email``.
         """
         data = self._get_sequence_data()
         if not data:
@@ -2044,10 +2158,9 @@ class ClaudeAccountSwitcher:
         if slot is None:
             return
         existing_kind = self._account_kind(slot)
-        new_kind = "api_key" if is_api_key else "oauth"
         if existing_kind != new_kind:
-            existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
-            new_label = "API-key" if is_api_key else "OAuth"
+            existing_label = self._KIND_LABELS[existing_kind]
+            new_label = self._KIND_LABELS[new_kind]
             raise ValidationError(
                 f"'{email}' already exists as an {existing_label} account "
                 f"(slot {slot}); cannot add it as an {new_label} account. "
@@ -2225,8 +2338,32 @@ class ClaudeAccountSwitcher:
             except ValueError as e:
                 raise ValidationError(str(e)) from e
 
+        # A live third-party provider block is what claude authenticates with,
+        # so capture that instead of the dormant ``oauthAccount`` under it —
+        # and before the identity check below, which would otherwise report
+        # "no active account" on a machine configured by ``/setup-bedrock``.
+        #
+        # Once it IS managed, this falls through to the ordinary OAuth capture
+        # instead of reporting "already managed": a Bedrock user still has a
+        # dormant Claude login underneath, and `cswap add` is how they register
+        # it. So a machine's whole state stays reachable — provider first (it is
+        # the live login), then the account beneath it on the next run.
         identity = self._get_current_account()
+        live_provider = provider.live_provider_config()
+        if live_provider is not None and not self._provider_already_managed(
+            live_provider, slot
+        ):
+            self._add_captured_provider(live_provider, slot, assume_yes, alias)
+            return
+
         if identity is None:
+            if live_provider is not None:
+                raise ConfigError(
+                    "This machine's third-party provider configuration is "
+                    "already managed, and there is no Claude login underneath "
+                    "it to add. Log in with 'claude /login' first, or register "
+                    "another provider with 'cswap add-provider'."
+                )
             raise ConfigError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid = identity
 
@@ -2484,7 +2621,7 @@ class ClaudeAccountSwitcher:
         # Don't silently overwrite/convert an existing account of the other kind:
         # identity is matched on (email, org) only, so an api-key and an OAuth
         # account sharing an email would be indistinguishable at switch time.
-        self._reject_cross_kind_collision(email, is_api_key)
+        self._reject_cross_kind_collision(email, "api_key" if is_api_key else "oauth")
 
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
@@ -2507,6 +2644,45 @@ class ClaudeAccountSwitcher:
             }
         })
 
+        self._register_placeholder_slot(
+            email=email,
+            credentials=credentials,
+            config=config,
+            kind="api_key" if is_api_key else None,
+            slot=slot,
+            assume_yes=assume_yes,
+            kind_label="API key" if is_api_key else "token",
+            source_label="API key" if is_api_key else "token",
+        )
+
+    def _register_placeholder_slot(
+        self,
+        *,
+        email: str,
+        credentials: str,
+        config: str,
+        kind: str | None,
+        slot: int | None,
+        assume_yes: bool,
+        kind_label: str,
+        source_label: str,
+        alias: str | None = None,
+    ) -> str | None:
+        """Register a slot for an account with a *synthesized* identity.
+
+        The shared tail of ``add_account_from_token`` and provider registration:
+        both describe an account with no server-side identity (personal org,
+        blank uuid, placeholder email), so slot selection, occupied-slot
+        confirmation, cross-slot migration, and the sequence-file write are the
+        same work. Only the stored material and the wording differ, which is what
+        the arguments carry.
+
+        ``kind`` is the ``sequence.json`` kind field (``None`` for plain OAuth
+        setup-tokens, which are kindless for back-compat).
+
+        Returns the slot number written, or ``None`` when the user declined an
+        occupied-slot overwrite.
+        """
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
             seq = self._get_sequence_data()
@@ -2524,15 +2700,24 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (email, "")}
             )
+            # An in-place refresh may also change the slot's kind (e.g.
+            # re-capturing a slot after switching its provider's auth method),
+            # so the record's kind is rewritten alongside the material.
+            record = seq["accounts"][account_num]
+            if kind is None:
+                record.pop("kind", None)
+            else:
+                record["kind"] = kind
+            if alias is not None:
+                record["alias"] = alias
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
-            kind_label = "API key" if is_api_key else "token"
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
                 f"({email} {muted('[personal]')})."
             )
-            return
+            return account_num
 
         displace_slot = None
         migrate_from = None
@@ -2568,10 +2753,10 @@ class ClaudeAccountSwitcher:
                             answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
                         except (EOFError, KeyboardInterrupt):
                             print(f"\n{dimmed('Cancelled')}")
-                            return
+                            return None
                         if answer not in ("y", "yes"):
                             print(dimmed("Cancelled"))
-                            return
+                            return None
                     displace_slot = (
                         account_num,
                         existing_email,
@@ -2615,8 +2800,10 @@ class ClaudeAccountSwitcher:
             "organizationName": "",
             "added": get_timestamp(),
         }
-        if is_api_key:
-            record["kind"] = "api_key"
+        if kind is not None:
+            record["kind"] = kind
+        if alias is not None:
+            record["alias"] = alias
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -2624,7 +2811,6 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        source_label = "API key" if is_api_key else "token"
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
@@ -2632,6 +2818,136 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+        return account_num
+
+    # -- provider registration --------------------------------------------
+
+    def _provider_placeholder_email(self, provider_name: str, slot: int) -> str:
+        """Default label for a provider slot: ``mantle-3@provider.local``.
+
+        Provider configs carry no email, so — exactly as ``--add-token`` does —
+        one is synthesized rather than demanded. The slot number keys it
+        uniquely; ``.local`` is reserved for exactly this kind of non-routable
+        name.
+        """
+        return f"{provider_name.lower()}-{slot}@provider.local"
+
+    def add_provider_account(
+        self,
+        config,
+        email: str | None = None,
+        slot: int | None = None,
+        assume_yes: bool = False,
+        alias: str | None = None,
+    ) -> str | None:
+        """Register a third-party provider configuration as a managed account.
+
+        ``config`` is a validated :class:`provider.ProviderConfig` (or anything
+        :func:`provider.parse_provider_config` accepts — the CLI, live capture,
+        and import all funnel through that one validator). No network calls are
+        made: a provider config is activated purely by writing env, so there is
+        nothing to verify against a server here. A wrong region or a revoked
+        token surfaces on the first real request, the same way it would if the
+        user had run ``/setup-bedrock``.
+
+        Returns the slot written, or ``None`` when an occupied-slot overwrite was
+        declined.
+        """
+        config = provider.parse_provider_config(
+            config if not isinstance(config, provider.ProviderConfig) else config.to_dict()
+        )
+
+        if email and not self._validate_email(email):
+            raise ValidationError(f"Invalid email format: {email}")
+        if alias is not None:
+            try:
+                alias = normalize_alias(alias)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
+
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+
+        if not email:
+            if slot is None:
+                slot = self._get_next_account_number()
+            email = self._provider_placeholder_email(config.provider, slot)
+
+        if alias is not None:
+            conflict = self._alias_in_use(alias)
+            if conflict is not None:
+                raise ValidationError(
+                    f"Alias '{alias}' is already used by account {conflict}"
+                )
+
+        # Same reason as for tokens: identity is (email, org) only, so a
+        # provider slot must not share an email with an OAuth or API-key slot.
+        self._reject_cross_kind_collision(email, "provider")
+
+        # The config *is* the slot's stored material (secret, for bearer and
+        # access-key auth), so it goes through the ordinary credential store.
+        # The config backup still carries a synthesized ``oauthAccount``: the
+        # switch path and ``_account_is_switchable`` both require one.
+        return self._register_placeholder_slot(
+            email=email,
+            credentials=config.to_json(),
+            config=json.dumps({
+                "oauthAccount": {
+                    "emailAddress": email,
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }),
+            kind="provider",
+            slot=slot,
+            assume_yes=assume_yes,
+            kind_label=f"{config.label} configuration",
+            source_label=f"{config.label}, {config.describe_auth()}",
+            alias=alias,
+        )
+
+    def _provider_already_managed(self, config, slot: int | None) -> bool:
+        """Whether this exact live provider config already occupies a slot.
+
+        Unlike an OAuth login there is no token to re-capture, so re-adding an
+        identical config would only churn the store (and retain a redundant
+        ``.prev`` generation). An explicit ``--slot`` that names a *different*
+        slot is still honored — the user asked to put it there.
+        """
+        active_slot = self.active_provider_slot()
+        if active_slot is None or (slot is not None and str(slot) != active_slot):
+            return False
+        stored = self._provider_config_for(
+            active_slot, self.account_email(active_slot)
+        )
+        return stored is not None and provider.env_block_for(
+            stored
+        ) == provider.env_block_for(config)
+
+    def _add_captured_provider(
+        self,
+        config,
+        slot: int | None,
+        assume_yes: bool,
+        alias: str | None,
+    ) -> None:
+        """``cswap add`` branch for a live third-party provider configuration."""
+        written = self.add_provider_account(
+            config, slot=slot, assume_yes=assume_yes, alias=alias
+        )
+        if written is None:
+            return
+        # The captured config IS the live one, so this slot is active from the
+        # moment it is registered — record that rather than making the next
+        # status read guess it from a fingerprint scan.
+        provider.write_marker(self.backup_dir, written, get_timestamp())
+        data = self._get_sequence_data() or {}
+        if data:
+            data["activeAccountNumber"] = int(written)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
@@ -2706,6 +3022,20 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
+        # Removing the provider account that is currently live: clear the env
+        # block it put in settings.json first. Leaving it would strand a
+        # configuration no slot owns any more — still authenticating claude,
+        # unswitchable, and (for bearer/access-key auth) still holding a secret
+        # in plaintext after the slot that stored it is gone.
+        removing_live_provider = self.active_provider_slot(data) == account_num
+        if removing_live_provider:
+            provider.clear_block()
+            provider.clear_marker(self.backup_dir)
+            self._logger.info(
+                "Cleared Account-%s's third-party provider block on removal",
+                account_num,
+            )
+
         # Remove backup files
         self._delete_account_files(account_num, email)
 
@@ -2717,6 +3047,12 @@ class ClaudeAccountSwitcher:
         self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
+        if removing_live_provider:
+            print(dimmed(
+                "Its provider settings were removed from settings.json — you "
+                "are now on whichever login Claude Code resolves next. Switch "
+                "to a specific account with: cswap switch <num|email>"
+            ))
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
@@ -2726,16 +3062,25 @@ class ClaudeAccountSwitcher:
         Shared by list_accounts and the usage-aware switch helpers so the active
         slot is detected and credentials are read in exactly one place. The
         active account's credentials come from Claude Code's live store; every
-        other slot reads its backup copy.
+        other slot reads its backup copy — except a provider slot, whose
+        material is an env block the credential store knows nothing about, so it
+        always reads its backup (see ``active_provider_slot``).
         """
         data = self._get_sequence_data_migrated() or {}
-        current_identity = self._get_current_account()
-
-        # Find active account number by (email, organizationUuid) composite key
-        active_num = None
-        if current_identity is not None:
-            current_email, current_org_uuid = current_identity
-            active_num = self._find_account_slot(data, current_email, current_org_uuid)
+        # A live provider env block outranks ``oauthAccount``: it is what claude
+        # actually authenticates with, while the ``oauthAccount`` beneath it is
+        # the dormant identity of whatever login the provider was switched on
+        # over. Falling back only when no provider is live keeps first-party
+        # installs on exactly the previous code path.
+        active_num = self.active_provider_slot(data)
+        if active_num is None:
+            # Find active account number by (email, organizationUuid) composite key
+            current_identity = self._get_current_account()
+            if current_identity is not None:
+                current_email, current_org_uuid = current_identity
+                active_num = self._find_account_slot(
+                    data, current_email, current_org_uuid
+                )
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
@@ -2750,7 +3095,7 @@ class ClaudeAccountSwitcher:
             alias = account.get("alias", "") or ""
             is_active = str(num) == active_num
 
-            if is_active:
+            if is_active and account.get("kind") != "provider":
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._active_keychain_unavailable = active.keychain_unavailable
@@ -3371,6 +3716,12 @@ class ClaudeAccountSwitcher:
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
+        if provider.looks_like_provider_config(creds):
+            # Third-party provider account: billed by the cloud account, and
+            # there is no usage endpoint to fetch at all. Detected from the
+            # stored bytes rather than the slot's ``kind`` so this stays a pure
+            # function of the collected row (no sequence.json read per account).
+            return USAGE_PROVIDER
         if not creds or not oauth.extract_access_token(creds):
             if is_active and self._active_keychain_unavailable:
                 return USAGE_KEYCHAIN_UNAVAILABLE
@@ -4027,33 +4378,65 @@ class ClaudeAccountSwitcher:
         (``--status`` touches one slot) and runs it through the shared
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
+
+        A provider slot reads its backup rather than the live credential store,
+        for the reason ``_build_accounts_info`` documents: the live store holds
+        the dormant login the provider was switched on over.
         """
-        active = self._read_active_credentials()
-        creds = active.value or ""
-        self._active_keychain_unavailable = active.keychain_unavailable
+        if self._account_kind(account_num) == "provider":
+            creds = self._read_account_credentials(str(account_num), current_email)
+        else:
+            active = self._read_active_credentials()
+            creds = active.value or ""
+            self._active_keychain_unavailable = active.keychain_unavailable
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
-        identity = self._get_current_account()
-        if identity is None:
-            return {"schemaVersion": SCHEMA_VERSION, "active": None}
-        current_email, current_org_uuid = identity
-
         data = self._get_sequence_data_migrated()
-        if not data:
+
+        # A live provider env block is the login claude actually uses, so it
+        # settles the active account before ``oauthAccount`` is consulted — and
+        # an *unmanaged* provider block reports unmanaged rather than falling
+        # through to the dormant identity beneath it.
+        live_provider = provider.live_provider_config()
+        account_num = self.active_provider_slot(data) if live_provider else None
+        if live_provider is not None and not account_num:
             return {
                 "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
+                "active": {
+                    "email": "",
+                    "managed": False,
+                    "provider": live_provider.provider,
+                },
             }
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
-        if not account_num:
-            return {
-                "schemaVersion": SCHEMA_VERSION,
-                "active": {"email": current_email, "managed": False},
-            }
+        if account_num:
+            current_email = data["accounts"][account_num].get("email", "")
+            current_org_uuid = data["accounts"][account_num].get(
+                "organizationUuid", ""
+            ) or ""
+        else:
+            identity = self._get_current_account()
+            if identity is None:
+                return {"schemaVersion": SCHEMA_VERSION, "active": None}
+            current_email, current_org_uuid = identity
+
+            if not data:
+                return {
+                    "schemaVersion": SCHEMA_VERSION,
+                    "active": {"email": current_email, "managed": False},
+                }
+
+            account_num = self._find_account_slot(
+                data, current_email, current_org_uuid
+            )
+            if not account_num:
+                return {
+                    "schemaVersion": SCHEMA_VERSION,
+                    "active": {"email": current_email, "managed": False},
+                }
 
         acct = data["accounts"][account_num]
         org_name = acct.get("organizationName", "") or ""
@@ -4094,18 +4477,40 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_status_payload()
 
-        identity = self._get_current_account()
-        if identity is None:
-            print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
-            return None
-        current_email, current_org_uuid = identity
-
         data = self._get_sequence_data_migrated()
-        if not data:
-            print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+
+        # Same precedence as the JSON payload: a live provider block is the
+        # login in force, so it settles the answer before ``oauthAccount``.
+        live_provider = provider.live_provider_config()
+        account_num = self.active_provider_slot(data) if live_provider else None
+        if live_provider is not None and not account_num:
+            print(
+                f"{bolded('Status:')} {live_provider.label} "
+                f"{dimmed('(not managed)')}"
+            )
+            print(dimmed("  Add it with: cswap add"))
             return None
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        if account_num:
+            current_email = data["accounts"][account_num].get("email", "")
+            current_org_uuid = (
+                data["accounts"][account_num].get("organizationUuid", "") or ""
+            )
+        else:
+            identity = self._get_current_account()
+            if identity is None:
+                print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
+                return None
+            current_email, current_org_uuid = identity
+
+            if not data:
+                print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
+                return None
+
+            account_num = self._find_account_slot(
+                data, current_email, current_org_uuid
+            )
+
         org_name = ""
         if account_num is not None:
             org_name = data["accounts"][account_num].get("organizationName", "") or ""
@@ -4255,12 +4660,18 @@ class ClaudeAccountSwitcher:
         # Ensure org fields are migrated before checking composite key
         self._get_sequence_data_migrated()
 
+        # A live provider account IS a live login even with no ``oauthAccount``
+        # (a machine set up by ``/setup-bedrock`` has none), so it must not take
+        # the fresh-machine path below — that would ignore where the user
+        # actually is and re-activate the recorded slot.
+        provider_slot = self.active_provider_slot()
+
         # Fresh-machine path: no live Claude session, but we have managed accounts
         # (e.g. right after cswap --import). Activate the recorded
         # activeAccountNumber, or fall back to the first slot in sequence.
         # With no live state to capture, the target must have valid backups —
         # walk the sequence if the preferred target is broken.
-        if identity is None:
+        if identity is None and provider_slot is None:
             data = self._get_sequence_data() or {}
             sequence = data.get("sequence", [])
             preferred = data.get("activeAccountNumber")
@@ -4310,10 +4721,18 @@ class ClaudeAccountSwitcher:
                 if json_output else None
             )
 
-        current_email, current_org_uuid = identity
+        if provider_slot is not None:
+            # A managed provider account is live: it is the account being left,
+            # and the ``oauthAccount`` beneath it (if any) is dormant.
+            current_email = self.account_email(provider_slot)
+            current_org_uuid = ""
+        else:
+            current_email, current_org_uuid = identity
 
         # Check if current account is managed
-        if not self._account_exists(current_email, current_org_uuid):
+        if provider_slot is None and not self._account_exists(
+            current_email, current_org_uuid
+        ):
             # In JSON mode, don't silently auto-add (a surprising side effect in
             # automation) — report it as a structured no-op instead.
             if json_output:
@@ -4352,7 +4771,9 @@ class ClaudeAccountSwitcher:
         # Where the user actually is right now (live identity), falling back to
         # the recorded active slot. Used so usage-aware switching never moves
         # them onto an account worse than their current one.
-        current_num = self._find_account_slot(data, current_email, current_org_uuid)
+        current_num = provider_slot or self._find_account_slot(
+            data, current_email, current_org_uuid
+        )
         if current_num is None:
             current_num = str(active_account) if active_account is not None else None
 
@@ -4666,27 +5087,48 @@ class ClaudeAccountSwitcher:
         # a *resolved* divergence falls through so _perform_switch can
         # reconcile it.
         provenance: dict | None = None
-        if not force and data:
+        # A live provider block — managed or not — is what claude authenticates
+        # with, so no credential-shaped slot can be "already active" underneath
+        # one. Skipping the no-op then is what makes the switch actually take
+        # effect: the block has to be cleared, and only ``_perform_switch``
+        # does that.
+        unowned_provider_block = (
+            self._account_kind(target_account) != "provider"
+            and bool(provider.read_live_block())
+        )
+        if not force and data and not unowned_provider_block:
+            # Which slot we are on: a live provider block outranks the
+            # ``oauthAccount`` beneath it, which is dormant while a provider
+            # flag is set (see ``active_provider_slot``).
+            provider_slot = self.active_provider_slot(data)
             identity = self._get_current_account()
-            if identity is not None:
+            cur_slot = provider_slot
+            cur_email = self.account_email(provider_slot) if provider_slot else ""
+            if cur_slot is None and identity is not None:
                 cur_slot = self._find_account_slot(data, identity[0], identity[1])
-                if cur_slot == target_account:
-                    action, provenance = self._self_switch_action(
-                        target_account, identity[0]
-                    )
-                if cur_slot == target_account and action != "reconcile":
+                cur_email = identity[0]
+            if cur_slot == target_account:
+                action, provenance = self._self_switch_action(
+                    target_account, cur_email
+                )
+                if action != "reconcile":
                     email = (
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
                     ref = account_ref(int(target_account), email)
+                    restore_hint = (
+                        "To rewrite settings.json from the stored configuration, run: "
+                        if self._account_kind(target_account) == "provider"
+                        else "To rewrite the live login from the stored backup "
+                        "(e.g. after --import), run: "
+                    )
                     if not json_output:
                         print(
                             f"{accent('Already on')} Account-{target_account} ({email})"
                         )
                         print(dimmed(
-                            "To rewrite the live login from the stored backup "
-                            "(e.g. after --import), run: "
-                            f"cswap --switch-to {target_account} --force"
+                            restore_hint
+                            + f"cswap --switch-to {target_account} --force"
                         ))
                         return None
                     return self._switch_noop(
@@ -4760,7 +5202,21 @@ class ClaudeAccountSwitcher:
           either. Leaving everything untouched is also the safe write:
           activating the stored backup over an unverified live credential
           could replace a freshly rotated token with its consumed ancestor.
+
+        A third-party provider slot has no credential lineage to classify, so
+        the live env block settles it: an exact match is a plain no-op, and a
+        drifted block reconciles (rewriting it from the stored config) with no
+        provenance to prefetch. Conversely a credential-shaped slot is never
+        "already active" while ANY provider block is live — managed or not, it
+        is what claude authenticates with — so that reconciles too, which is
+        what gets the block cleared.
         """
+        if self._account_kind(slot) == "provider":
+            if self.active_provider_slot() == slot:
+                return "noop", None
+            return "reconcile", {"live": None, "resolved": None}
+        if provider.read_live_block():
+            return "reconcile", self._prefetch_live_identity()
         if self._live_matches_slot_backup(slot, email):
             return "noop", None
         provenance = self._prefetch_live_identity()
@@ -5021,6 +5477,193 @@ class ClaudeAccountSwitcher:
         )
         return entry_id
 
+    def _activate_provider_target(
+        self,
+        target_account: str,
+        target_email: str,
+        *,
+        to_ref: dict,
+        leaving_slot: str | None,
+        leaving_identity: tuple[str, str] | None,
+        data: dict,
+        provenance: dict,
+        force_activate: bool,
+        emit_output: bool,
+        warnings_out: list[str],
+    ) -> dict:
+        """Activate a third-party provider slot. Caller holds every lock.
+
+        The provider half of ``_perform_switch``. Writing the env block is the
+        whole activation: there is no credential to write, no ``oauthAccount`` to
+        splice, and nothing to compose from the live credential.
+
+        The **live credential is deliberately left in place.** It is dormant
+        while a provider flag is set (claude resolves the provider first), and
+        keeping it means switching back to that account needs no re-login. Its
+        slot still gets the ordinary backup treatment first, so a token the
+        server rotated since the last switch is captured before it goes dormant
+        — which is why this reuses ``_classify_outgoing_credential`` rather than
+        skipping the backup: the outgoing account here is credential-shaped, and
+        only its *destination* differs.
+
+        Switching provider → provider needs no backup at all: the credential in
+        the store belongs to neither account, and a provider config is never
+        rotated by the server, so nothing can have drifted.
+        """
+        config = self._provider_config_for(target_account, target_email)
+        if config is None:
+            raise SwitchError(
+                f"Account-{target_account} has no usable stored provider "
+                f"configuration. Re-add with: cswap add-provider --slot "
+                f"{target_account} …"
+            )
+
+        # Back up the outgoing credential-shaped account, exactly as the normal
+        # path does — unless we are leaving another provider account (nothing
+        # live is that account's), or the caller forced a bare activation.
+        leaving_provider = self._account_kind(leaving_slot) == "provider"
+        if (
+            not force_activate
+            and not leaving_provider
+            and leaving_identity is not None
+            and leaving_slot is not None
+        ):
+            self._backup_outgoing_for_provider_switch(
+                leaving_slot,
+                leaving_identity[0],
+                data=data,
+                provenance=provenance,
+                emit_output=emit_output,
+                warnings_out=warnings_out,
+            )
+
+        previous_block = provider.apply_block(provider.env_block_for(config))
+        try:
+            provider.write_marker(self.backup_dir, target_account, get_timestamp())
+            data["activeAccountNumber"] = int(target_account)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+        except Exception:
+            # The block landed but the bookkeeping didn't: put the previous
+            # block back so the recorded state and the live one agree.
+            try:
+                provider.apply_block(previous_block)
+            except Exception as e:
+                self._logger.error(
+                    f"Failed to restore the provider block after a failed "
+                    f"switch: {e}"
+                )
+            raise
+
+        self._logger.info(
+            "Activated account %s (%s, %s)",
+            target_account, config.label, config.describe_auth(),
+        )
+        from_ref = (
+            account_ref(int(leaving_slot), self.account_email(leaving_slot))
+            if leaving_slot is not None
+            else account_ref(None, leaving_identity[0])
+            if leaving_identity is not None
+            else None
+        )
+        if emit_output:
+            print(
+                f"{accent('Switched to')} Account-{target_account} "
+                f"({target_email}) {muted(f'[{config.label}]')}"
+            )
+            try:
+                self.list_accounts()
+            except Exception as e:
+                self._logger.warning(f"Post-switch usage display failed: {e!r}")
+            print()
+            print(dimmed(
+                "Claude Code reads this from settings.json at startup — restart "
+                "Claude Code (or reopen the VS Code extension tab) to pick it up. "
+                "An exported provider variable in your shell still wins over it."
+            ))
+            print()
+        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+
+    def _backup_outgoing_for_provider_switch(
+        self,
+        current_account: str,
+        current_email: str,
+        *,
+        data: dict,
+        provenance: dict,
+        emit_output: bool,
+        warnings_out: list[str],
+    ) -> None:
+        """Back up the credential-shaped account a provider switch is leaving.
+
+        The same classification the normal switch path applies, minus the
+        activation that follows it there — a provider switch leaves the live
+        credential in place, so this only ensures the outgoing slot's stored copy
+        is current before it goes dormant. Never fatal: unlike the normal path
+        nothing is about to overwrite the live credential, so a failure here
+        costs a possibly-stale backup rather than a lost token.
+        """
+        try:
+            original_creds = self._read_credentials()
+            if not original_creds:
+                self._logger.info(
+                    "No live credential to back up before activating a "
+                    "third-party provider account"
+                )
+                return
+            original_config = self._get_claude_config_path().read_text(
+                encoding="utf-8"
+            )
+        except Exception as e:
+            self._logger.warning(
+                "Could not read the live login before activating a provider "
+                "account (%s); its stored backup may be a generation behind", e
+            )
+            return
+
+        kind, foreign_slot = self._classify_outgoing_credential(
+            current_account, current_email, original_creds, provenance, data,
+        )
+        if kind in ("foreign", "alien", "known-foreign"):
+            # Positively another account's bytes. Nothing is overwriting them
+            # here (the live store is left as-is), so unlike the normal path
+            # there is nothing to preserve — just don't file them under this
+            # slot, and say so.
+            msg = (
+                "The live login does not belong to Account-"
+                f"{current_account}; it was left in place and not written "
+                "into that slot's backup."
+            )
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+            self._logger.warning(
+                "Skipped backing up Account-%s before a provider switch: live "
+                "credential classified %s (owner slot %s)",
+                current_account, kind, foreign_slot or "unknown",
+            )
+            return
+        try:
+            if kind != "own-bytes":
+                self._write_account_credentials(
+                    current_account, current_email, original_creds
+                )
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+        except Exception as e:
+            self._logger.warning(
+                "Could not refresh Account-%s's backup before activating a "
+                "provider account (%s); it may be a generation behind",
+                current_account, e,
+            )
+            return
+        self._logger.info(
+            "Backed up account %s before activating a third-party provider "
+            "account", current_account,
+        )
+
     def _perform_switch(
         self,
         target_account: str,
@@ -5041,6 +5684,12 @@ class ClaudeAccountSwitcher:
         managed live login exists: the stored backup is written over the live
         credentials without backing the live ones up first (post-import recovery
         when the live login is stale).
+
+        A **third-party provider** target takes its own branch (see
+        ``_activate_provider_target``): its material is an env block, not a
+        credential, so none of the credential-shaped steps below apply.
+        Switching *away* from a provider account, in contrast, needs only the
+        env block cleared before the ordinary path runs — handled inline.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -5096,6 +5745,21 @@ class ClaudeAccountSwitcher:
             target_email = data["accounts"][target_account]["email"]
             to_ref = account_ref(int(target_account), target_email)
             current_identity = self._get_current_account()
+            # A live provider block outranks ``oauthAccount`` when naming the
+            # account being left — the precedence every read path applies (see
+            # ``active_provider_slot``). It does NOT redirect the backup step
+            # below: a provider slot has no live credential of its own, so the
+            # credential still in the store belongs to whichever login the
+            # provider was switched on over, and that is the slot it must be
+            # backed up to. Hence ``current_account`` keeps following
+            # ``oauthAccount`` while ``from_ref`` reports the provider.
+            provider_slot = self.active_provider_slot(data)
+            # Clearing keys on *any* live provider block, not just a managed
+            # one: an unmanaged block (set up by /setup-bedrock, or left behind
+            # by removing the slot that owned it) shadows the credential being
+            # activated just as effectively, and the switch would otherwise
+            # report success while claude kept using the provider.
+            provider_block_live = bool(provider.read_live_block())
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
                 current_account = self._find_account_slot(
@@ -5103,6 +5767,20 @@ class ClaudeAccountSwitcher:
                 )
 
             config_path = self._get_claude_config_path()
+
+            if self._account_kind(target_account) == "provider":
+                return self._activate_provider_target(
+                    target_account,
+                    target_email,
+                    to_ref=to_ref,
+                    leaving_slot=provider_slot or current_account,
+                    leaving_identity=current_identity,
+                    data=data,
+                    provenance=provenance,
+                    force_activate=force_activate,
+                    emit_output=emit_output,
+                    warnings_out=warnings_out,
+                )
 
             # Direct activation path: there is no live Claude session yet
             # (e.g. right after import), claude-swap has no tracked active
@@ -5208,7 +5886,19 @@ class ClaudeAccountSwitcher:
 
                 creds_written = False
                 config_written = False
+                provider_block: dict | None = None
                 try:
+                    if provider_block_live:
+                        # Same reason as on the normal path: a live provider flag
+                        # outranks the credential being activated, so it must be
+                        # cleared or the switch would not take effect. Captured
+                        # for this path's own inline rollback below.
+                        provider_block = provider.clear_block()
+                        provider.clear_marker(self.backup_dir)
+                        self._logger.info(
+                            "Cleared the live third-party provider block (%s)",
+                            f"Account-{provider_slot}" if provider_slot else "unmanaged",
+                        )
                     self._write_credentials(
                         self._prepare_credentials_for_activation(
                             target_creds, rollback_creds
@@ -5252,6 +5942,17 @@ class ClaudeAccountSwitcher:
                             self._logger.error(
                                 f"Failed to rollback credentials: {e}"
                             )
+                    if provider_block is not None:
+                        try:
+                            provider.apply_block(provider_block)
+                            if provider_slot is not None:
+                                provider.write_marker(
+                                    self.backup_dir, provider_slot, get_timestamp()
+                                )
+                        except Exception as e:
+                            self._logger.error(
+                                f"Failed to rollback the provider block: {e}"
+                            )
                     raise
 
                 if force_activate and current_identity is not None:
@@ -5278,7 +5979,15 @@ class ClaudeAccountSwitcher:
                 return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
             current_email, _ = current_identity
-            from_ref = account_ref(int(current_account), current_email)
+            # The account being *left* is the provider slot when one is live,
+            # even though the credential being backed up below belongs to the
+            # dormant login beneath it (see the note where provider_slot is
+            # resolved).
+            from_ref = (
+                account_ref(int(provider_slot), self.account_email(provider_slot))
+                if provider_slot is not None
+                else account_ref(int(current_account), current_email)
+            )
 
             # Create transaction for rollback capability
             try:
@@ -5310,6 +6019,21 @@ class ClaudeAccountSwitcher:
             )
 
             try:
+                if provider_block_live:
+                    # Leaving a provider configuration for a credential-shaped
+                    # account: the env block has to go, or its provider flag
+                    # would keep outranking the credential activated below and
+                    # the switch would silently not take effect. Recorded as a
+                    # transaction step so a later failure restores it with
+                    # everything else.
+                    transaction.original_provider_block = provider.clear_block()
+                    transaction.record_step("provider_block_written")
+                    provider.clear_marker(self.backup_dir)
+                    self._logger.info(
+                        "Cleared the live third-party provider block (%s)",
+                        f"Account-{provider_slot}" if provider_slot else "unmanaged",
+                    )
+
                 # Step 1: Backup current account. Position in ~/.claude.json
                 # says which slot is active; only the classification says who
                 # owns the live bytes (issue #117: an external write here

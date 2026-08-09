@@ -171,6 +171,11 @@ class SwitchTransaction:
     original_email: str
     config_path: Path
     completed_steps: list[str] = field(default_factory=list)
+    #: The managed provider env block that was live before this switch wrote
+    #: one, captured by ``provider.apply_block``'s return. ``None`` when the
+    #: switch never touched the block; ``{}`` is meaningful (no provider was
+    #: active, so rollback must clear rather than restore).
+    original_provider_block: dict | None = None
 
     def record_step(self, step: str) -> None:
         """Record a completed step."""
@@ -193,6 +198,13 @@ class SwitchTransaction:
                     )
                     if sys.platform != "win32":
                         os.chmod(self.config_path, 0o600)
+                elif step == "provider_block_written":
+                    # Restoring {} clears the managed keys, which is correct:
+                    # an empty capture means no provider account was active
+                    # before this switch wrote one.
+                    from claude_swap import provider
+
+                    provider.apply_block(self.original_provider_block or {})
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()
                     if data:

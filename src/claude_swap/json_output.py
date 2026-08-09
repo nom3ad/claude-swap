@@ -23,6 +23,11 @@ USAGE_TOKEN_EXPIRED = "token expired"
 # API-key (``/login`` managed key) accounts have no subscription quota; usage is
 # reported as this sentinel instead of being fetched from the OAuth usage API.
 USAGE_API_KEY = "api key"
+# Third-party provider accounts (Bedrock/Mantle/Vertex/Foundry) bill through the
+# cloud account, not an Anthropic subscription, and expose no usage endpoint at
+# all — same reporting shape as ``USAGE_API_KEY``, distinct so the row can name
+# the provider.
+USAGE_PROVIDER = "provider"
 # The active account's macOS Keychain was unreadable (locked / denied / timeout)
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
 # isn't misled into an unnecessary re-login.
@@ -141,7 +146,9 @@ def usage_fields(
     (active token expired and the refresh was deferred this pass — lock
     contention, unattributable lineage, or a failed persist; retried
     automatically), the ``USAGE_API_KEY`` sentinel
-    (managed API-key account, no subscription quota), the
+    (managed API-key account, no subscription quota), the ``USAGE_PROVIDER``
+    sentinel (third-party provider account — billed by the cloud account, with
+    no usage endpoint to fetch), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
     another account; usage suppressed, a switch repairs the drift), the
@@ -154,6 +161,8 @@ def usage_fields(
         return "token_expired", None
     if entry == USAGE_API_KEY:
         return "api_key", None
+    if entry == USAGE_PROVIDER:
+        return "provider", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:
