@@ -221,7 +221,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root, alongside `active-provider.json` when a third-party provider account is active (it just records which slot the live provider config came from).
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
 Third-party provider accounts are the exception to the table above: their configuration is not a credential but the `env` block of Claude Code's own `~/.claude/settings.json`, which is where activating one writes (the stored copy still lives in the credential store, since a bearer token or access key is secret material).
 
