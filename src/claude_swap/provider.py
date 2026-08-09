@@ -7,6 +7,12 @@ Vertex, Microsoft Foundry — with no credential at all: the whole configuration
 is **environment variables**, and Claude Code's own ``/setup-bedrock`` wizard
 persists them into the ``env`` object of ``<config-home>/settings.json``.
 
+So a provider account here *is* an env dict. Nothing models AWS auth methods,
+regions, or model pins as fields: those are just keys, and keeping them keys is
+what lets one code path serve every provider (Vertex takes a project id where
+Bedrock takes a region; Foundry takes neither). Activation writes the dict;
+capture reads it back. There is no translation layer to get wrong.
+
 Verified against the claude 2.1.223 bundle:
 
 - The provider is chosen by a boolean flag env var, resolved in a fixed order
@@ -15,7 +21,9 @@ Verified against the claude 2.1.223 bundle:
   ``…_USE_VERTEX`` → vertex. First flag set wins; see ``PROVIDER_ORDER``.
 - AWS auth resolves in a fixed precedence: ``AWS_BEARER_TOKEN_BEDROCK`` (sent as
   ``Authorization: Bearer …``), else the static-key trio, else the ambient AWS
-  provider chain (which honors ``AWS_PROFILE``, SSO, IMDS).
+  provider chain (which honors ``AWS_PROFILE``, SSO, IMDS). cswap does not need
+  to know this — it stores whichever keys the user set — but it is why the
+  clear-set below is not optional.
 - The wizard's env writer (``tff``) sets every key it does *not* need to
   ``undefined``, so changing provider or auth method removes the previous one's
   keys. :data:`MANAGED_ENV_KEYS` is that same clear-set: activation deletes all
@@ -23,10 +31,10 @@ Verified against the claude 2.1.223 bundle:
   ``AWS_BEARER_TOKEN_BEDROCK`` would silently outrank a freshly activated
   static-key account.
 
-This module is the single owner of the config ↔ env-block translation and of
-the ``settings.json`` splice. It is deliberately a **leaf**: it imports only
-``paths``/``fsutil``/``settings``/``claude_locks``/``exceptions`` and never the
-switcher, mirroring how ``credentials.py`` stays a leaf collaborator.
+This module is the single owner of the ``settings.json`` splice. It is
+deliberately a **leaf**: it imports only ``paths``/``settings``/``claude_locks``/
+``exceptions`` and never the switcher, mirroring how ``credentials.py`` stays a
+leaf collaborator.
 
 Third-party accounts have no server identity, no refresh token, and no
 subscription-quota endpoint, so nothing here talks to the network.
@@ -37,7 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
@@ -54,46 +62,29 @@ PROVIDER_CONFIG_VERSION = 1
 
 @dataclass(frozen=True)
 class ProviderSpec:
-    """One third-party provider: its flag, label, and region variable.
+    """One third-party provider: its flag env var and its display label.
 
     ``label`` is copied verbatim from the bundle's provider label map so cswap
-    names a provider the way Claude Code's own UI does. ``region_key`` is the
-    env var that provider takes its region/location from, or ``""`` when it has
-    none (Foundry is addressed by resource, not region). ``aws`` marks the
-    providers that authenticate through the AWS credential chain, which are the
-    only ones with auth methods beyond ``environment``.
+    names a provider the way Claude Code's own UI does.
     """
 
     flag: str
     label: str
-    region_key: str
-    aws: bool
 
 
 #: Providers in Claude Code's own resolution order (``Mn()``). A block with more
 #: than one flag set resolves to the first entry here, exactly as claude does.
 PROVIDERS: dict[str, ProviderSpec] = {
-    "bedrock": ProviderSpec(
-        "CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock", "AWS_REGION", True
-    ),
-    "foundry": ProviderSpec(
-        "CLAUDE_CODE_USE_FOUNDRY", "Microsoft Foundry", "", False
-    ),
+    "bedrock": ProviderSpec("CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"),
+    "foundry": ProviderSpec("CLAUDE_CODE_USE_FOUNDRY", "Microsoft Foundry"),
     "anthropicAws": ProviderSpec(
-        "CLAUDE_CODE_USE_ANTHROPIC_AWS", "Claude Platform on AWS", "AWS_REGION", True
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS", "Claude Platform on AWS"
     ),
     "anthropicGoogleCloud": ProviderSpec(
-        "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-        "Claude Platform on Google Cloud",
-        "ANTHROPIC_GOOGLE_CLOUD_LOCATION",
-        False,
+        "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "Claude Platform on Google Cloud"
     ),
-    "mantle": ProviderSpec(
-        "CLAUDE_CODE_USE_MANTLE", "Amazon Bedrock (Mantle)", "AWS_REGION", True
-    ),
-    "vertex": ProviderSpec(
-        "CLAUDE_CODE_USE_VERTEX", "Google Vertex AI", "CLOUD_ML_REGION", False
-    ),
+    "mantle": ProviderSpec("CLAUDE_CODE_USE_MANTLE", "Amazon Bedrock (Mantle)"),
+    "vertex": ProviderSpec("CLAUDE_CODE_USE_VERTEX", "Google Vertex AI"),
 }
 
 PROVIDER_ORDER = tuple(PROVIDERS)
@@ -109,25 +100,24 @@ _PROVIDER_ALIASES = {
     "google-cloud": "anthropicGoogleCloud",
 }
 
-#: AWS auth methods, named as ``/setup-bedrock`` names them (``tff``'s switch).
-#: ``environment`` stores nothing and lets the ambient AWS provider chain
-#: resolve — the right choice for SSO, IMDS, or a container role.
-AWS_AUTH_METHODS = ("bearer", "profile", "accessKey", "environment")
-
-#: Non-AWS providers authenticate through their own SDK's ambient credentials
-#: (ADC for Google, an API key for Foundry). cswap does not model those as
-#: structured auth methods — they travel in the ``env`` passthrough — so those
-#: providers accept only ``environment``.
-_ENVIRONMENT_ONLY = ("environment",)
+PROVIDER_FLAGS = frozenset(spec.flag for spec in PROVIDERS.values())
 
 # -- the managed env keys ---------------------------------------------------
 #
-# Everything cswap owns inside settings.json's ``env``. Activation clears all
-# of these before writing an account's own keys (see the module docstring on
-# why a partial write is unsafe), so a key that belongs to a provider config
-# MUST be listed here or switching away from that account would leave it live.
+# Everything cswap owns inside settings.json's ``env``. Activation clears all of
+# these before writing an account's own keys (see the module docstring on why a
+# partial write is unsafe), so a key that belongs to a provider config MUST be
+# listed here or switching away from that account would leave it live. That is
+# also why ``--set`` refuses an unlisted key rather than passing it through.
+#
+# Grouped by what they configure, purely for reading; the union is what matters.
 
-_PROVIDER_FLAGS = frozenset(spec.flag for spec in PROVIDERS.values())
+_REGION_KEYS = frozenset({
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "CLOUD_ML_REGION",
+    "ANTHROPIC_GOOGLE_CLOUD_LOCATION",
+})
 
 _AUTH_KEYS = frozenset({
     "AWS_BEARER_TOKEN_BEDROCK",
@@ -135,11 +125,13 @@ _AUTH_KEYS = frozenset({
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
 })
-
-_REGION_KEYS = frozenset({"AWS_REGION", "AWS_DEFAULT_REGION"}) | frozenset(
-    spec.region_key for spec in PROVIDERS.values() if spec.region_key
-)
 
 #: Per-tier model pins, keyed the way ``--pin-<tier>`` and the wizard name them.
 MODEL_PIN_KEYS = {
@@ -149,10 +141,7 @@ MODEL_PIN_KEYS = {
     "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
 }
 
-#: Provider-scoped keys cswap carries verbatim rather than modelling. Every one
-#: is a key claude reads only under a third-party provider, so clearing them
-#: when no provider is active cannot disturb a first-party login.
-PASSTHROUGH_ENV_KEYS = frozenset({
+_ENDPOINT_KEYS = frozenset({
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
@@ -161,7 +150,6 @@ PASSTHROUGH_ENV_KEYS = frozenset({
     "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
     "ANTHROPIC_BEDROCK_SERVICE_TIER",
     "ANTHROPIC_AWS_BASE_URL",
-    "ANTHROPIC_AWS_API_KEY",
     "ANTHROPIC_AWS_WORKSPACE_ID",
     "ANTHROPIC_VERTEX_PROJECT_ID",
     "ANTHROPIC_VERTEX_BASE_URL",
@@ -169,11 +157,6 @@ PASSTHROUGH_ENV_KEYS = frozenset({
     "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID",
     "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
     "ANTHROPIC_FOUNDRY_RESOURCE",
-    "ANTHROPIC_FOUNDRY_API_KEY",
-    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "AWS_CONFIG_FILE",
-    "AWS_SHARED_CREDENTIALS_FILE",
     "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
     "CLAUDE_CODE_SKIP_MANTLE_AUTH",
     "CLAUDE_CODE_SKIP_VERTEX_AUTH",
@@ -183,15 +166,16 @@ PASSTHROUGH_ENV_KEYS = frozenset({
 })
 
 MANAGED_ENV_KEYS: frozenset[str] = (
-    _PROVIDER_FLAGS
-    | _AUTH_KEYS
+    PROVIDER_FLAGS
     | _REGION_KEYS
+    | _AUTH_KEYS
     | frozenset(MODEL_PIN_KEYS.values())
-    | PASSTHROUGH_ENV_KEYS
+    | _ENDPOINT_KEYS
 )
 
-#: Managed keys whose value is a secret: masked in every display surface, and
-#: called out when exporting. Mirrors the bundle's own hidden-value set.
+#: Managed keys whose value is a secret: masked in every display surface,
+#: prompted for rather than taken from argv, and called out when exporting.
+#: Mirrors the bundle's own hidden-value set.
 SECRET_ENV_KEYS = frozenset({
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_SECRET_ACCESS_KEY",
@@ -230,74 +214,42 @@ def normalize_provider(name: str) -> str:
     )
 
 
-def auth_methods_for(provider: str) -> tuple[str, ...]:
-    """Auth methods a provider accepts (AWS providers get all four)."""
-    return AWS_AUTH_METHODS if PROVIDERS[provider].aws else _ENVIRONMENT_ONLY
-
-
 @dataclass(frozen=True)
 class ProviderConfig:
-    """A third-party provider configuration — one managed slot's material.
+    """A third-party provider configuration: a provider id and an env block.
 
-    Stored through the ordinary per-account credential store (so it inherits the
-    0600 ``.enc`` files, the macOS Keychain backend, and ``.prev`` retention),
-    because for ``bearer``/``accessKey`` accounts it *is* secret material.
+    The ``env`` mapping is exactly what gets written into ``settings.json`` (the
+    provider flag included), so activation is a copy and capture is a read.
+
+    Stored through the ordinary per-account credential store, so it inherits the
+    0600 ``.enc`` files, the macOS Keychain backend, and ``.prev`` retention —
+    for a bearer-token or access-key account it *is* secret material.
     """
 
     provider: str
-    auth_method: str
-    region: str = ""
-    bearer_token: str = ""
-    aws_profile: str = ""
-    access_key_id: str = ""
-    secret_access_key: str = ""
-    session_token: str = ""
-    #: Extra managed keys carried verbatim (see PASSTHROUGH_ENV_KEYS).
-    env: Mapping[str, str] = field(default_factory=dict)
-    #: tier -> model id (see MODEL_PIN_KEYS).
-    model_pins: Mapping[str, str] = field(default_factory=dict)
-
-    @property
-    def spec(self) -> ProviderSpec:
-        return PROVIDERS[self.provider]
+    env: Mapping[str, str]
 
     @property
     def label(self) -> str:
         """Human provider name, as Claude Code's own UI spells it."""
-        return self.spec.label
+        return PROVIDERS[self.provider].label
 
-    def describe_auth(self) -> str:
-        """One-line description of how this account authenticates."""
-        if self.auth_method == "bearer":
-            return "bearer token"
-        if self.auth_method == "profile":
-            return f"AWS profile {self.aws_profile}"
-        if self.auth_method == "accessKey":
-            return f"access key {self.access_key_id}"
-        return "ambient credentials"
+    def summary(self) -> str:
+        """One-line description: the label plus the keys it sets.
+
+        Names keys rather than interpreting them — cswap deliberately does not
+        model what "bearer auth" is, so it reports what is configured and lets
+        the key names speak. Secret values are never included.
+        """
+        keys = sorted(set(self.env) - PROVIDER_FLAGS)
+        return f"{self.label} — {', '.join(keys)}" if keys else self.label
 
     def to_dict(self) -> dict:
-        """JSON form, omitting every field this auth method does not use."""
-        out: dict = {
+        return {
             "schemaVersion": PROVIDER_CONFIG_VERSION,
             "provider": self.provider,
-            "authMethod": self.auth_method,
+            "env": dict(self.env),
         }
-        for key, value in (
-            ("region", self.region),
-            ("bearerToken", self.bearer_token),
-            ("awsProfile", self.aws_profile),
-            ("accessKeyId", self.access_key_id),
-            ("secretAccessKey", self.secret_access_key),
-            ("sessionToken", self.session_token),
-        ):
-            if value:
-                out[key] = value
-        if self.env:
-            out["env"] = dict(self.env)
-        if self.model_pins:
-            out["modelPins"] = dict(self.model_pins)
-        return out
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2)
@@ -308,8 +260,8 @@ def looks_like_provider_config(credentials: str | None) -> bool:
 
     Strict on purpose, and checked the same way everywhere a stored blob's kind
     has to be told from its bytes (export, import, capture): a provider config
-    is a JSON object carrying a recognized ``provider`` and an ``authMethod``.
-    An OAuth blob has neither, and a raw API key is not JSON at all.
+    is a JSON object carrying a recognized ``provider``. An OAuth blob has none,
+    and a raw API key is not JSON at all.
     """
     if not credentials:
         return False
@@ -320,25 +272,27 @@ def looks_like_provider_config(credentials: str | None) -> bool:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return False
-    return (
-        isinstance(data, dict)
-        and data.get("provider") in PROVIDERS
-        and isinstance(data.get("authMethod"), str)
-    )
+    return isinstance(data, dict) and data.get("provider") in PROVIDERS
 
 
-def parse_provider_config(data: object, *, label: str = "provider config") -> ProviderConfig:
+def parse_provider_config(
+    data: object, *, label: str = "provider config"
+) -> ProviderConfig:
     """Validate a provider config (dict or JSON text) into a ProviderConfig.
 
     The single validation chokepoint: the CLI, live capture, and import all come
     through here, so a malformed config is rejected identically wherever it
-    enters. Every rejection names the offending field — these are configs users
-    type by hand.
+    enters. Two things are checked, both because getting them wrong would break
+    activation rather than merely inconvenience the user:
 
-    Raises:
-        ValidationError: unknown provider, auth method not valid for it,
-            an auth method missing its material, an unmanaged ``env`` key,
-            an unknown model-pin tier, or a region on a provider without one.
+    - The provider must be one claude knows (it supplies the flag to set).
+    - Every ``env`` key must be in :data:`MANAGED_ENV_KEYS`, so it can also be
+      *cleared* when switching away (see :func:`_validated_env_key`).
+
+    Whether the keys form a working configuration is deliberately NOT checked:
+    the provider decides that, cswap would only be guessing, and a wrong guess
+    would refuse a valid setup. A missing region or revoked token surfaces on
+    the first request, exactly as it would after ``/setup-bedrock``.
     """
     if isinstance(data, str):
         try:
@@ -349,98 +303,21 @@ def parse_provider_config(data: object, *, label: str = "provider config") -> Pr
         raise ValidationError(f"{label} must be a JSON object")
 
     provider = normalize_provider(str(data.get("provider") or ""))
-    spec = PROVIDERS[provider]
-
-    auth_method = str(data.get("authMethod") or "").strip()
-    allowed = auth_methods_for(provider)
-    if auth_method not in allowed:
-        if spec.aws:
-            raise ValidationError(
-                f"{label}: unknown auth method '{auth_method}'; expected one "
-                f"of: {', '.join(allowed)}"
-            )
-        raise ValidationError(
-            f"{label}: {spec.label} authenticates through its own ambient "
-            f"credentials, so authMethod must be 'environment' (got "
-            f"'{auth_method}'). Pass provider-specific variables with --set."
-        )
-
-    def text(key: str) -> str:
-        value = data.get(key, "")
-        if value is None:
-            return ""
-        if not isinstance(value, str):
-            raise ValidationError(f"{label}: {key} must be a string")
-        return value.strip()
-
-    region = text("region")
-    if region and not spec.region_key:
-        raise ValidationError(
-            f"{label}: {spec.label} has no region setting; address it with "
-            f"--set ANTHROPIC_FOUNDRY_RESOURCE=… instead."
-        )
-
-    bearer_token = text("bearerToken")
-    aws_profile = text("awsProfile")
-    access_key_id = text("accessKeyId")
-    secret_access_key = text("secretAccessKey")
-    session_token = text("sessionToken")
-
-    if auth_method == "bearer" and not bearer_token:
-        raise ValidationError(f"{label}: bearer auth requires a bearerToken")
-    if auth_method == "profile" and not aws_profile:
-        raise ValidationError(f"{label}: profile auth requires an awsProfile")
-    if auth_method == "accessKey" and not (access_key_id and secret_access_key):
-        raise ValidationError(
-            f"{label}: accessKey auth requires both accessKeyId and "
-            "secretAccessKey"
-        )
-    if auth_method != "accessKey" and session_token:
-        raise ValidationError(
-            f"{label}: sessionToken applies to accessKey auth only"
-        )
-
-    # Drop material the chosen method doesn't use rather than storing a secret
-    # that can never be activated (and would still be exported).
-    if auth_method != "bearer":
-        bearer_token = ""
-    if auth_method != "profile":
-        aws_profile = ""
-    if auth_method != "accessKey":
-        access_key_id = secret_access_key = session_token = ""
 
     raw_env = data.get("env") or {}
     if not isinstance(raw_env, dict):
         raise ValidationError(f"{label}: env must be a JSON object")
-    env: dict[str, str] = {}
-    for key, value in raw_env.items():
-        env[_validated_env_key(key, label)] = _validated_env_value(key, value, label)
-
-    raw_pins = data.get("modelPins") or {}
-    if not isinstance(raw_pins, dict):
-        raise ValidationError(f"{label}: modelPins must be a JSON object")
-    pins: dict[str, str] = {}
-    for tier, value in raw_pins.items():
-        key = str(tier).strip().lower()
-        if key not in MODEL_PIN_KEYS:
-            raise ValidationError(
-                f"{label}: unknown model tier '{tier}'; expected one of: "
-                f"{', '.join(MODEL_PIN_KEYS)}"
-            )
-        pins[key] = _validated_env_value(tier, value, label)
-
-    return ProviderConfig(
-        provider=provider,
-        auth_method=auth_method,
-        region=region,
-        bearer_token=bearer_token,
-        aws_profile=aws_profile,
-        access_key_id=access_key_id,
-        secret_access_key=secret_access_key,
-        session_token=session_token,
-        env=env,
-        model_pins=pins,
-    )
+    env = {
+        _validated_env_key(key, label): _validated_env_value(key, value, label)
+        for key, value in raw_env.items()
+        # Flags are re-derived from ``provider`` below, so a stored one is
+        # redundant rather than wrong — drop it instead of rejecting the whole
+        # config (which would make every config fail its own round trip).
+        if str(key).strip() not in PROVIDER_FLAGS
+    }
+    # The flag comes from the provider id, so a config cannot contradict itself.
+    env = {PROVIDERS[provider].flag: "1", **env}
+    return ProviderConfig(provider=provider, env=env)
 
 
 def _validated_env_key(key: object, label: str) -> str:
@@ -457,11 +334,6 @@ def _validated_env_key(key: object, label: str) -> str:
             "manages, so it could not be removed when switching away. "
             "Set it in settings.json directly if you want it always on."
         )
-    if name in _PROVIDER_FLAGS:
-        raise ValidationError(
-            f"{label}: '{name}' is set from the provider itself; pass "
-            "--provider instead of setting the flag."
-        )
     return name
 
 
@@ -471,44 +343,26 @@ def _validated_env_value(key: object, value: object, label: str) -> str:
     return value.strip()
 
 
-def parse_env_assignment(assignment: str) -> tuple[str, str]:
-    """Parse one ``KEY=VALUE`` from ``--set``. Raises on a bad key or shape."""
-    if "=" not in assignment:
-        raise ValidationError(
-            f"--set expects KEY=VALUE, got '{assignment}'"
-        )
-    key, _, value = assignment.partition("=")
-    name = _validated_env_key(key, "--set")
-    return name, _validated_env_value(name, value, "--set")
+def parse_env_assignment(assignment: str) -> tuple[str, str | None]:
+    """Parse one ``--set`` argument into ``(key, value | None)``.
 
-
-def env_block_for(config: ProviderConfig) -> dict[str, str]:
-    """The env block that activates ``config``.
-
-    Mirrors the wizard's ``tff``: the provider flag, the region, exactly the
-    keys the chosen auth method needs, then pins and passthrough. Only keys with
-    a value appear — the *absence* of a managed key is how it gets cleared, and
-    :func:`apply_block` deletes every managed key not present here.
+    ``None`` means no value was given inline, which the CLI turns into a prompt
+    (or a stdin read for ``KEY=-``) so a secret need never appear in argv or
+    shell history. The key is validated here either way.
     """
-    spec = config.spec
-    block: dict[str, str] = {spec.flag: "1"}
-    if config.region and spec.region_key:
-        block[spec.region_key] = config.region
-    if config.auth_method == "bearer":
-        block["AWS_BEARER_TOKEN_BEDROCK"] = config.bearer_token
-    elif config.auth_method == "profile":
-        block["AWS_PROFILE"] = config.aws_profile
-    elif config.auth_method == "accessKey":
-        block["AWS_ACCESS_KEY_ID"] = config.access_key_id
-        block["AWS_SECRET_ACCESS_KEY"] = config.secret_access_key
-        if config.session_token:
-            block["AWS_SESSION_TOKEN"] = config.session_token
-    for tier, model in config.model_pins.items():
-        block[MODEL_PIN_KEYS[tier]] = model
-    # Passthrough last so an explicit --set wins over a derived value (e.g. a
-    # user pinning AWS_DEFAULT_REGION alongside --region).
-    block.update(config.env)
-    return block
+    key, sep, value = assignment.partition("=")
+    name = str(key).strip()
+    if name in PROVIDER_FLAGS:
+        # Unlike a stored config (where the flag is redundant), setting it by
+        # hand contradicts --provider — which is the flag's only source.
+        raise ValidationError(
+            f"--set: '{name}' is set from the provider itself; pass "
+            "--provider instead of setting the flag."
+        )
+    name = _validated_env_key(name, "--set")
+    if not sep:
+        return name, None
+    return name, _validated_env_value(name, value, "--set")
 
 
 def config_from_block(block: Mapping[str, str]) -> ProviderConfig | None:
@@ -516,9 +370,9 @@ def config_from_block(block: Mapping[str, str]) -> ProviderConfig | None:
 
     Resolution mirrors claude's ``Mn()``: the first flag in
     :data:`PROVIDER_ORDER` whose value is truthy wins, so a block with several
-    flags is read exactly as claude would run it. Auth method is inferred with
-    claude's own precedence — bearer, then static keys, then profile/ambient —
-    so a captured account authenticates the way the live config already does.
+    flags is read exactly as claude would run it. Everything else in the block
+    is carried verbatim — capture stores what is live rather than re-deriving
+    what it means.
     """
     provider = next(
         (
@@ -530,74 +384,20 @@ def config_from_block(block: Mapping[str, str]) -> ProviderConfig | None:
     )
     if provider is None:
         return None
-    spec = PROVIDERS[provider]
-
-    def value(key: str) -> str:
-        raw = block.get(key)
-        return raw.strip() if isinstance(raw, str) else ""
-
-    bearer = value("AWS_BEARER_TOKEN_BEDROCK")
-    access_key_id = value("AWS_ACCESS_KEY_ID")
-    secret_access_key = value("AWS_SECRET_ACCESS_KEY")
-    profile = value("AWS_PROFILE")
-
-    if not spec.aws:
-        auth_method = "environment"
-    elif bearer:
-        auth_method = "bearer"
-    elif access_key_id and secret_access_key:
-        auth_method = "accessKey"
-    elif profile:
-        auth_method = "profile"
-    else:
-        auth_method = "environment"
-
-    region = value(spec.region_key) if spec.region_key else ""
-    pins = {
-        tier: value(key)
-        for tier, key in MODEL_PIN_KEYS.items()
-        if value(key)
-    }
-    # Whatever else is managed and set travels verbatim, minus the keys the
-    # structured fields above already own for this provider/auth method.
-    claimed = set(env_block_for(
-        ProviderConfig(
-            provider=provider,
-            auth_method=auth_method,
-            region=region,
-            bearer_token=bearer,
-            aws_profile=profile,
-            access_key_id=access_key_id,
-            secret_access_key=secret_access_key,
-            session_token=value("AWS_SESSION_TOKEN"),
-            model_pins=pins,
-        )
-    ))
-    env = {
-        key: value(key)
-        for key in sorted(MANAGED_ENV_KEYS - claimed - _PROVIDER_FLAGS)
-        if value(key)
-    }
-    return ProviderConfig(
-        provider=provider,
-        auth_method=auth_method,
-        region=region,
-        bearer_token=bearer,
-        aws_profile=profile,
-        access_key_id=access_key_id,
-        secret_access_key=secret_access_key,
-        session_token=value("AWS_SESSION_TOKEN") if auth_method == "accessKey" else "",
-        env=env,
-        model_pins=pins,
-    )
+    env = {PROVIDERS[provider].flag: "1"}
+    env.update({
+        key: value.strip()
+        for key, value in block.items()
+        if key not in PROVIDER_FLAGS and isinstance(value, str) and value.strip()
+    })
+    return ProviderConfig(provider=provider, env=env)
 
 
 def _truthy(value: object) -> bool:
     """Claude's ``tr()``: a var counts as set unless it is empty/0/false."""
     if value is None:
         return False
-    text = str(value).strip().lower()
-    return text not in ("", "0", "false")
+    return str(value).strip().lower() not in ("", "0", "false")
 
 
 def block_fingerprint(block: Mapping[str, str]) -> str:
@@ -636,7 +436,8 @@ def settings_path() -> Path:
 
 
 def _settings_lock_dir() -> Path:
-    return settings_path().parent / (settings_path().name + ".lock")
+    path = settings_path()
+    return path.parent / (path.name + ".lock")
 
 
 def _load_settings_for_write() -> dict:
@@ -668,30 +469,34 @@ def _load_settings_for_write() -> dict:
     return data
 
 
-def read_live_block() -> dict[str, str]:
-    """The managed env keys currently set in ``settings.json``.
+def _managed_only(env: Mapping[str, object]) -> dict[str, str]:
+    """The managed, usable subset of an ``env`` mapping.
 
-    ``{}`` when the file is missing, unreadable, malformed, or simply has no
-    managed keys — a read must never raise into a status/list render. Only
-    string values are returned: claude coerces its env values from JSON, and a
+    Only string values count: claude coerces its env values from JSON, and a
     non-string there is a hand-edit cswap should report as absent rather than
     pretend to understand.
     """
-    path = settings_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    env = data.get("env")
-    if not isinstance(env, dict):
-        return {}
     return {
         key: value
         for key, value in env.items()
         if key in MANAGED_ENV_KEYS and isinstance(value, str) and value
     }
+
+
+def read_live_block() -> dict[str, str]:
+    """The managed env keys currently set in ``settings.json``.
+
+    ``{}`` when the file is missing, unreadable, malformed, or simply has no
+    managed keys — a read must never raise into a status/list render.
+    """
+    try:
+        data = json.loads(settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    env = data.get("env")
+    return _managed_only(env) if isinstance(env, dict) else {}
 
 
 def live_provider_config() -> ProviderConfig | None:
@@ -727,11 +532,7 @@ def apply_block(block: Mapping[str, str]) -> dict[str, str]:
                 "before switching to a third-party provider account"
             )
         env = dict(env or {})
-        previous = {
-            key: value
-            for key, value in env.items()
-            if key in MANAGED_ENV_KEYS and isinstance(value, str) and value
-        }
+        previous = _managed_only(env)
         for key in MANAGED_ENV_KEYS:
             env.pop(key, None)
         env.update(block)
@@ -822,8 +623,3 @@ def resolve_active_slot(
         if block_fingerprint(slot_blocks[slot]) == live:
             return slot
     return None
-
-
-def with_region(config: ProviderConfig, region: str) -> ProviderConfig:
-    """Copy of ``config`` with a different region (used by the CLI's overrides)."""
-    return replace(config, region=region.strip())

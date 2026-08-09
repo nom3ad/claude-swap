@@ -56,14 +56,19 @@ def _switcher() -> ClaudeAccountSwitcher:
     return s
 
 
-def _bearer_config(region: str = "us-east-1", **kw) -> provider.ProviderConfig:
-    return provider.ProviderConfig(
-        provider=kw.pop("provider", "bedrock"),
-        auth_method="bearer",
-        region=region,
-        bearer_token=kw.pop("bearer_token", BEARER),
-        **kw,
-    )
+def _config(name: str = "bedrock", **env) -> provider.ProviderConfig:
+    """A provider config from plain env keys, via the real validator."""
+    return provider.parse_provider_config({"provider": name, "env": env})
+
+
+def _bearer_config(
+    region: str = "us-east-1",
+    *,
+    name: str = "bedrock",
+    bearer_token: str = BEARER,
+) -> provider.ProviderConfig:
+    """The common case: a provider addressed by region with a bearer token."""
+    return _config(name, AWS_REGION=region, AWS_BEARER_TOKEN_BEDROCK=bearer_token)
 
 
 def _write_settings(data: dict) -> Path:
@@ -139,14 +144,6 @@ class TestProviderRegistry:
         with pytest.raises(ValidationError, match="unknown provider 'azure'"):
             provider.normalize_provider("azure")
 
-    def test_aws_providers_get_every_auth_method(self):
-        assert provider.auth_methods_for("bedrock") == provider.AWS_AUTH_METHODS
-        assert provider.auth_methods_for("mantle") == provider.AWS_AUTH_METHODS
-
-    def test_non_aws_providers_are_environment_only(self):
-        assert provider.auth_methods_for("vertex") == ("environment",)
-        assert provider.auth_methods_for("foundry") == ("environment",)
-
     def test_every_provider_flag_is_managed(self):
         # A flag missing from the clear-set would survive a switch away.
         for spec in provider.PROVIDERS.values():
@@ -157,79 +154,87 @@ class TestProviderRegistry:
 
 
 class TestEnvBlock:
-    def test_bearer_block_matches_setup_bedrock(self):
-        block = provider.env_block_for(_bearer_config())
-        assert block == {
+    def test_the_config_is_the_env_block(self):
+        # Activation is a copy, not a translation: whatever keys were set are
+        # exactly what lands in settings.json, plus the provider's own flag.
+        config = _config(
+            "bedrock", AWS_REGION="us-east-1", AWS_BEARER_TOKEN_BEDROCK=BEARER
+        )
+        assert config.env == {
             "CLAUDE_CODE_USE_BEDROCK": "1",
             "AWS_REGION": "us-east-1",
             "AWS_BEARER_TOKEN_BEDROCK": BEARER,
         }
 
-    def test_profile_block(self):
-        config = provider.ProviderConfig(
-            provider="bedrock", auth_method="profile",
-            region="eu-west-1", aws_profile="my-sso",
-        )
-        assert provider.env_block_for(config) == {
-            "CLAUDE_CODE_USE_BEDROCK": "1",
-            "AWS_REGION": "eu-west-1",
-            "AWS_PROFILE": "my-sso",
-        }
+    def test_the_flag_comes_from_the_provider_id(self):
+        # So a config can never contradict itself about which provider it is.
+        assert _config("mantle").env == {"CLAUDE_CODE_USE_MANTLE": "1"}
+        assert _config("vertex").env == {"CLAUDE_CODE_USE_VERTEX": "1"}
 
-    def test_access_key_block_with_session_token(self):
-        config = provider.ProviderConfig(
-            provider="bedrock", auth_method="accessKey", region="us-west-2",
-            access_key_id="AKIA1", secret_access_key="s3cret",
-            session_token="tok",
-        )
-        assert provider.env_block_for(config) == {
-            "CLAUDE_CODE_USE_BEDROCK": "1",
-            "AWS_REGION": "us-west-2",
-            "AWS_ACCESS_KEY_ID": "AKIA1",
-            "AWS_SECRET_ACCESS_KEY": "s3cret",
-            "AWS_SESSION_TOKEN": "tok",
-        }
-
-    def test_environment_block_carries_no_secret(self):
-        config = provider.ProviderConfig(
-            provider="bedrock", auth_method="environment", region="us-east-1"
-        )
-        assert provider.env_block_for(config) == {
+    def test_a_stored_flag_is_dropped_not_rejected(self):
+        # A round-tripped config carries its flag; re-deriving it keeps parse
+        # idempotent instead of failing every config's own round trip.
+        config = provider.parse_provider_config({
+            "provider": "bedrock",
+            "env": {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-east-1"},
+        })
+        assert config.env == {
             "CLAUDE_CODE_USE_BEDROCK": "1",
             "AWS_REGION": "us-east-1",
         }
 
-    def test_vertex_uses_its_own_region_variable(self):
-        config = provider.ProviderConfig(
-            provider="vertex", auth_method="environment", region="us-central1"
-        )
-        block = provider.env_block_for(config)
-        assert block["CLOUD_ML_REGION"] == "us-central1"
-        assert "AWS_REGION" not in block
+    @pytest.mark.parametrize(
+        "name,env",
+        [
+            # Whatever a provider needs is just keys — no per-provider fields.
+            ("bedrock", {"AWS_REGION": "eu-west-1", "AWS_PROFILE": "my-sso"}),
+            ("bedrock", {
+                "AWS_ACCESS_KEY_ID": "AKIA1",
+                "AWS_SECRET_ACCESS_KEY": "s3cret",
+                "AWS_SESSION_TOKEN": "tok",
+            }),
+            ("vertex", {
+                "CLOUD_ML_REGION": "us-central1",
+                "ANTHROPIC_VERTEX_PROJECT_ID": "my-proj",
+            }),
+            ("foundry", {"ANTHROPIC_FOUNDRY_RESOURCE": "my-resource"}),
+            ("anthropicGoogleCloud", {"ANTHROPIC_GOOGLE_CLOUD_PROJECT": "p"}),
+        ],
+    )
+    def test_any_provider_shape_is_carried_verbatim(self, name, env):
+        config = _config(name, **env)
+        assert config.env == {provider.PROVIDERS[name].flag: "1", **env}
 
-    def test_model_pins_and_passthrough(self):
-        config = provider.ProviderConfig(
-            provider="bedrock", auth_method="environment",
-            model_pins={"opus": "anthropic.claude-opus-4-8"},
-            env={"ANTHROPIC_BEDROCK_SERVICE_TIER": "priority"},
+    def test_model_pins_are_just_keys(self):
+        config = _config(
+            "bedrock",
+            ANTHROPIC_DEFAULT_OPUS_MODEL="anthropic.claude-opus-4-8",
+            ANTHROPIC_BEDROCK_SERVICE_TIER="priority",
         )
-        block = provider.env_block_for(config)
-        assert block["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "anthropic.claude-opus-4-8"
-        assert block["ANTHROPIC_BEDROCK_SERVICE_TIER"] == "priority"
+        assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == (
+            "anthropic.claude-opus-4-8"
+        )
+        assert config.env["ANTHROPIC_BEDROCK_SERVICE_TIER"] == "priority"
 
     def test_live_mantle_block_round_trips(self):
         # The real configuration this feature was built against.
         config = provider.config_from_block(MANTLE_BLOCK)
         assert config is not None
-        assert (config.provider, config.auth_method) == ("mantle", "bearer")
-        assert config.region == "us-east-1"
-        assert config.bearer_token == BEARER
-        assert provider.env_block_for(config) == MANTLE_BLOCK
+        assert config.provider == "mantle"
+        assert config.env == MANTLE_BLOCK
 
     def test_round_trip_survives_json(self):
         config = provider.config_from_block(MANTLE_BLOCK)
         reparsed = provider.parse_provider_config(config.to_json())
-        assert provider.env_block_for(reparsed) == MANTLE_BLOCK
+        assert reparsed.env == MANTLE_BLOCK
+        assert reparsed.provider == "mantle"
+
+    def test_summary_names_keys_without_leaking_secrets(self):
+        summary = provider.config_from_block(MANTLE_BLOCK).summary()
+        assert "Amazon Bedrock (Mantle)" in summary
+        assert "AWS_BEARER_TOKEN_BEDROCK" in summary  # the key
+        assert BEARER not in summary  # never the value
+        assert "CLAUDE_CODE_USE_MANTLE" not in summary  # implied by the label
 
     def test_no_provider_flag_is_not_a_provider(self):
         assert provider.config_from_block({"AWS_REGION": "us-east-1"}) is None
@@ -249,23 +254,29 @@ class TestEnvBlock:
         })
         assert config.provider == "bedrock"  # first in PROVIDER_ORDER
 
-    def test_auth_inference_prefers_bearer_over_keys(self):
-        # claude sends the bearer token when both are present.
-        config = provider.config_from_block({
+    def test_capture_does_not_interpret_the_keys(self):
+        # Which key claude actually authenticates with is claude's business.
+        # Capturing every key verbatim means a config with both a bearer token
+        # and static keys keeps behaving exactly as it did before capture —
+        # cswap has no auth-precedence model of its own to get wrong.
+        block = {
             "CLAUDE_CODE_USE_BEDROCK": "1",
             "AWS_BEARER_TOKEN_BEDROCK": BEARER,
             "AWS_ACCESS_KEY_ID": "AKIA1",
             "AWS_SECRET_ACCESS_KEY": "s3cret",
-        })
-        assert config.auth_method == "bearer"
+        }
+        assert provider.config_from_block(block).env == block
 
-    def test_lone_access_key_id_is_not_static_auth(self):
+    def test_unmanaged_and_empty_keys_are_dropped_on_capture(self):
         config = provider.config_from_block({
             "CLAUDE_CODE_USE_BEDROCK": "1",
-            "AWS_ACCESS_KEY_ID": "AKIA1",
-            "AWS_PROFILE": "p",
+            "AWS_REGION": "us-east-1",
+            "AWS_PROFILE": "   ",
         })
-        assert config.auth_method == "profile"
+        assert config.env == {
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "AWS_REGION": "us-east-1",
+        }
 
     def test_fingerprint_is_order_independent_and_secret_free(self):
         a = provider.block_fingerprint({"A": "1", "B": "2"})
@@ -280,85 +291,75 @@ class TestEnvBlock:
 
 
 class TestValidation:
-    def test_bearer_requires_a_token(self):
-        with pytest.raises(ValidationError, match="requires a bearerToken"):
-            provider.parse_provider_config(
-                {"provider": "bedrock", "authMethod": "bearer"}
-            )
+    """Only two rules, both because breaking them breaks activation itself.
 
-    def test_profile_requires_a_profile_name(self):
-        with pytest.raises(ValidationError, match="requires an awsProfile"):
-            provider.parse_provider_config(
-                {"provider": "bedrock", "authMethod": "profile"}
-            )
+    Whether the keys form a *working* configuration is deliberately not checked:
+    the provider decides that, and a wrong guess here would refuse a valid
+    setup. A missing region or revoked token surfaces on the first request,
+    exactly as it would after ``/setup-bedrock``.
+    """
 
-    def test_access_key_requires_both_halves(self):
-        with pytest.raises(ValidationError, match="accessKeyId and secretAccessKey"):
-            provider.parse_provider_config({
-                "provider": "bedrock", "authMethod": "accessKey",
-                "accessKeyId": "AKIA1",
-            })
-
-    def test_session_token_needs_access_key_auth(self):
-        with pytest.raises(ValidationError, match="sessionToken applies"):
-            provider.parse_provider_config({
-                "provider": "bedrock", "authMethod": "bearer",
-                "bearerToken": BEARER, "sessionToken": "t",
-            })
-
-    def test_non_aws_provider_rejects_aws_auth(self):
-        with pytest.raises(ValidationError, match="ambient credentials"):
-            provider.parse_provider_config({
-                "provider": "vertex", "authMethod": "bearer",
-                "bearerToken": BEARER,
-            })
+    def test_unknown_provider_is_rejected(self):
+        with pytest.raises(ValidationError, match="unknown provider"):
+            provider.parse_provider_config({"provider": "azure", "env": {}})
 
     def test_unmanaged_env_key_is_rejected(self):
-        # An unmanaged key could not be cleared on the way out, so it would
-        # outlive its account.
-        with pytest.raises(ValidationError, match="does not manage|not a provider"):
+        # The load-bearing one: an unmanaged key gets written on activation but
+        # never cleared on the way out (MANAGED_ENV_KEYS is what the clear-set
+        # iterates), so it would outlive its account and leak into every other.
+        with pytest.raises(ValidationError, match="not a provider variable"):
             provider.parse_provider_config({
-                "provider": "bedrock", "authMethod": "environment",
-                "env": {"TOTALLY_UNRELATED": "x"},
+                "provider": "bedrock", "env": {"TOTALLY_UNRELATED": "x"},
             })
 
-    def test_provider_flag_cannot_be_set_directly(self):
-        with pytest.raises(ValidationError, match="pass --provider"):
-            provider.parse_provider_config({
-                "provider": "bedrock", "authMethod": "environment",
-                "env": {"CLAUDE_CODE_USE_VERTEX": "1"},
-            })
+    def test_an_incomplete_config_is_accepted(self):
+        # Static keys without their secret half is a real mistake — but it is
+        # the provider's error to report, and refusing it here would also
+        # refuse setups that work for reasons cswap cannot see (an instance
+        # role, a credential file, an ambient chain).
+        config = _config("bedrock", AWS_ACCESS_KEY_ID="AKIA1")
+        assert config.env["AWS_ACCESS_KEY_ID"] == "AKIA1"
 
-    def test_unknown_model_tier_is_rejected(self):
-        with pytest.raises(ValidationError, match="unknown model tier"):
-            provider.parse_provider_config({
-                "provider": "bedrock", "authMethod": "environment",
-                "modelPins": {"ultra": "m"},
-            })
+    def test_empty_values_are_rejected(self):
+        with pytest.raises(ValidationError, match="must be a non-empty string"):
+            _config("bedrock", AWS_REGION="")
 
-    def test_region_on_a_regionless_provider_is_rejected(self):
-        with pytest.raises(ValidationError, match="no region setting"):
-            provider.parse_provider_config({
-                "provider": "foundry", "authMethod": "environment",
-                "region": "us-east-1",
-            })
+    def test_non_object_env_is_rejected(self):
+        with pytest.raises(ValidationError, match="env must be a JSON object"):
+            provider.parse_provider_config({"provider": "bedrock", "env": "nope"})
 
-    def test_unused_material_is_dropped_not_stored(self):
-        # A secret that can never be activated must not linger in the store
-        # (it would still be exported).
-        config = provider.parse_provider_config({
-            "provider": "bedrock", "authMethod": "profile", "awsProfile": "p",
-            "bearerToken": BEARER,
-        })
-        assert config.bearer_token == ""
-        assert BEARER not in config.to_json()
+    def test_malformed_json_is_rejected(self):
+        with pytest.raises(ValidationError, match="not valid JSON"):
+            provider.parse_provider_config("{nope")
 
-    def test_parse_env_assignment(self):
+
+class TestSetAssignment:
+    def test_inline_value(self):
         assert provider.parse_env_assignment("AWS_PROFILE=dev") == (
             "AWS_PROFILE", "dev",
         )
-        with pytest.raises(ValidationError, match="KEY=VALUE"):
-            provider.parse_env_assignment("AWS_PROFILE")
+
+    def test_bare_key_defers_to_a_prompt(self):
+        # `--set KEY` with no value means "ask me", so a secret need never
+        # appear in argv (and so in shell history).
+        assert provider.parse_env_assignment("AWS_BEARER_TOKEN_BEDROCK") == (
+            "AWS_BEARER_TOKEN_BEDROCK", None,
+        )
+
+    def test_stdin_sentinel_is_passed_through(self):
+        assert provider.parse_env_assignment("AWS_SECRET_ACCESS_KEY=-") == (
+            "AWS_SECRET_ACCESS_KEY", "-",
+        )
+
+    def test_unmanaged_key_is_rejected(self):
+        with pytest.raises(ValidationError, match="not a provider variable"):
+            provider.parse_env_assignment("TOTALLY_UNRELATED=x")
+
+    def test_setting_a_provider_flag_by_hand_is_rejected(self):
+        # Unlike a stored config (where the flag is redundant and dropped),
+        # setting it by hand contradicts --provider, its only source.
+        with pytest.raises(ValidationError, match="pass --provider"):
+            provider.parse_env_assignment("CLAUDE_CODE_USE_VERTEX=1")
 
     def test_looks_like_provider_config(self):
         assert provider.looks_like_provider_config(_bearer_config().to_json())
@@ -377,7 +378,7 @@ class TestValidation:
 class TestApplyBlock:
     def test_writes_the_block_and_preserves_other_settings(self, temp_home: Path):
         _write_settings({"effortLevel": "xhigh", "env": {"MY_OWN": "keep"}})
-        previous = provider.apply_block(provider.env_block_for(_bearer_config()))
+        previous = provider.apply_block(_bearer_config().env)
 
         assert previous == {}  # nothing managed was live before
         settings = _read_settings()
@@ -389,27 +390,29 @@ class TestApplyBlock:
         # The property /setup-bedrock's tff() gets by setting every unused key
         # to undefined: a leftover bearer token outranks static keys in claude's
         # own precedence, so a partial write would silently use the wrong one.
-        provider.apply_block(provider.env_block_for(_bearer_config()))
+        provider.apply_block(_bearer_config().env)
         assert "AWS_BEARER_TOKEN_BEDROCK" in _live_env()
 
-        provider.apply_block(provider.env_block_for(provider.ProviderConfig(
-            provider="bedrock", auth_method="accessKey", region="us-west-2",
-            access_key_id="AKIA1", secret_access_key="s3cret",
-        )))
+        provider.apply_block(_config(
+            "bedrock",
+            AWS_REGION="us-west-2",
+            AWS_ACCESS_KEY_ID="AKIA1",
+            AWS_SECRET_ACCESS_KEY="s3cret",
+        ).env)
         env = _live_env()
         assert "AWS_BEARER_TOKEN_BEDROCK" not in env
         assert env["AWS_ACCESS_KEY_ID"] == "AKIA1"
 
     def test_switching_provider_clears_the_old_flag(self, temp_home: Path):
-        provider.apply_block(provider.env_block_for(_bearer_config(provider="mantle")))
-        provider.apply_block(provider.env_block_for(_bearer_config(provider="bedrock")))
+        provider.apply_block(_bearer_config(name="mantle").env)
+        provider.apply_block(_bearer_config(name="bedrock").env)
         env = _live_env()
         assert "CLAUDE_CODE_USE_MANTLE" not in env
         assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
     def test_returns_the_previous_managed_block(self, temp_home: Path):
         _write_settings({"env": dict(MANTLE_BLOCK)})
-        previous = provider.apply_block(provider.env_block_for(_bearer_config()))
+        previous = provider.apply_block(_bearer_config().env)
         assert previous == MANTLE_BLOCK
 
     def test_clear_block_removes_only_managed_keys(self, temp_home: Path):
@@ -431,7 +434,7 @@ class TestApplyBlock:
 
     def test_missing_settings_file_is_created(self, temp_home: Path):
         assert not provider.settings_path().exists()
-        provider.apply_block(provider.env_block_for(_bearer_config()))
+        provider.apply_block(_bearer_config().env)
         assert _live_env()["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
@@ -446,7 +449,7 @@ class TestApplyBlock:
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(real)
 
-        provider.apply_block(provider.env_block_for(_bearer_config()))
+        provider.apply_block(_bearer_config().env)
 
         assert link.is_symlink(), "the symlink was replaced by a regular file"
         assert json.loads(real.read_text(encoding="utf-8"))["env"][
@@ -526,7 +529,7 @@ class TestAddProviderAccount:
             s._read_account_credentials("1", "bedrock-1@provider.local")
         )
         assert stored["provider"] == "bedrock"
-        assert stored["bearerToken"] == BEARER
+        assert stored["env"]["AWS_BEARER_TOKEN_BEDROCK"] == BEARER
 
     def test_writes_a_synthesized_oauth_account_so_the_slot_is_switchable(
         self, temp_home: Path
@@ -548,9 +551,9 @@ class TestAddProviderAccount:
 
     def test_invalid_config_is_rejected(self, temp_home: Path):
         s = _switcher()
-        with pytest.raises(ValidationError, match="requires a bearerToken"):
+        with pytest.raises(ValidationError, match="not a provider variable"):
             s.add_provider_account(
-                {"provider": "bedrock", "authMethod": "bearer"}
+                {"provider": "bedrock", "env": {"TOTALLY_UNRELATED": "x"}}
             )
         assert s._get_sequence_data()["accounts"] == {}
 
@@ -563,7 +566,7 @@ class TestAddProviderAccount:
         data = s._get_sequence_data()
         assert len(data["accounts"]) == 1
         stored = json.loads(s._read_account_credentials("1", "p@example.com"))
-        assert stored["bearerToken"] == OTHER_BEARER
+        assert stored["env"]["AWS_BEARER_TOKEN_BEDROCK"] == OTHER_BEARER
 
     def test_cross_kind_collision_with_an_oauth_slot(self, temp_home: Path):
         s = _switcher()
@@ -588,7 +591,7 @@ class TestCaptureLiveProvider:
 
         assert s.account_kind_for("1") == "provider"
         stored = s._provider_config_for("1", "mantle-1@provider.local")
-        assert provider.env_block_for(stored) == MANTLE_BLOCK
+        assert stored.env == MANTLE_BLOCK
         assert "Amazon Bedrock (Mantle)" in capsys.readouterr().out
 
     def test_capture_marks_the_slot_active(self, temp_home: Path):
@@ -732,11 +735,10 @@ class TestSwitchToProvider:
 
     def test_provider_to_provider_replaces_the_block(self, temp_home: Path):
         s = _switcher()
-        s.add_provider_account(_bearer_config(provider="mantle"))
-        s.add_provider_account(provider.ProviderConfig(
-            provider="bedrock", auth_method="profile",
-            region="eu-west-1", aws_profile="my-sso",
-        ))
+        s.add_provider_account(_bearer_config(name="mantle"))
+        s.add_provider_account(
+            _config("bedrock", AWS_REGION="eu-west-1", AWS_PROFILE="my-sso")
+        )
         s.switch_to("1")
         s.switch_to("2")
 
@@ -792,9 +794,9 @@ class TestSwitchAwayFromProvider:
         s.switch_to("1")
         s.switch_to("2")
 
-        assert provider.env_block_for(
-            s._provider_config_for("2", "bedrock-2@provider.local")
-        ) == _live_env()
+        assert (
+            s._provider_config_for("2", "bedrock-2@provider.local").env == _live_env()
+        )
         assert s._read_account_credentials("1", "me@example.com") == OAUTH_JSON
 
     def test_an_unmanaged_block_is_also_cleared(self, temp_home: Path):
@@ -845,8 +847,8 @@ class TestSwitchAwayFromProvider:
         self, temp_home: Path
     ):
         s = _switcher()
-        s.add_provider_account(_bearer_config(provider="mantle"))
-        s.add_provider_account(_bearer_config(provider="bedrock"))
+        s.add_provider_account(_bearer_config(name="mantle"))
+        s.add_provider_account(_bearer_config(name="bedrock"))
         s.switch_to("1")
         live = provider.read_live_block()
 
@@ -1046,11 +1048,11 @@ class TestTransfer:
         assert entry["kind"] == "provider"
         # Every field is load-bearing for activation, so nothing is slimmed —
         # which means a bearer account's secret DOES travel in the export.
-        assert entry["credentials"]["bearerToken"] == BEARER
+        assert entry["credentials"]["env"]["AWS_BEARER_TOKEN_BEDROCK"] == BEARER
 
     def test_round_trip_preserves_the_config(self, temp_home, tmp_path):
         s = _switcher()
-        s.add_provider_account(_bearer_config(provider="mantle"))
+        s.add_provider_account(_bearer_config(name="mantle"))
         dest = tmp_path / "p.cswap"
         export_accounts(s, str(dest))
 
@@ -1064,8 +1066,7 @@ class TestTransfer:
         assert s.account_kind_for("1") == "provider"
         restored = s._provider_config_for("1", "mantle-1@provider.local")
         assert restored.provider == "mantle"
-        assert restored.auth_method == "bearer"
-        assert restored.bearer_token == BEARER
+        assert restored.env["AWS_BEARER_TOKEN_BEDROCK"] == BEARER
 
     def test_imported_config_is_validated(self, temp_home, tmp_path):
         s = _switcher()
@@ -1074,10 +1075,10 @@ class TestTransfer:
         export_accounts(s, str(dest))
 
         envelope = json.loads(dest.read_text(encoding="utf-8"))
-        del envelope["accounts"][0]["credentials"]["bearerToken"]
+        envelope["accounts"][0]["credentials"]["env"]["TOTALLY_UNRELATED"] = "x"
         dest.write_text(json.dumps(envelope), encoding="utf-8")
 
         from claude_swap.exceptions import TransferError
 
-        with pytest.raises(TransferError, match="requires a bearerToken"):
+        with pytest.raises(TransferError, match="not a provider variable"):
             import_accounts(s, str(dest), force=True)

@@ -2089,7 +2089,7 @@ class ClaudeAccountSwitcher:
                 continue
             config = self._provider_config_for(str(num), record.get("email", ""))
             if config is not None:
-                blocks[str(num)] = provider.env_block_for(config)
+                blocks[str(num)] = dict(config.env)
         return blocks
 
     def active_provider_slot(self, data: dict | None = None) -> str | None:
@@ -2904,7 +2904,7 @@ class ClaudeAccountSwitcher:
             slot=slot,
             assume_yes=assume_yes,
             kind_label=f"{config.label} configuration",
-            source_label=f"{config.label}, {config.describe_auth()}",
+            source_label=config.summary(),
             alias=alias,
         )
 
@@ -2922,9 +2922,7 @@ class ClaudeAccountSwitcher:
         stored = self._provider_config_for(
             active_slot, self.account_email(active_slot)
         )
-        return stored is not None and provider.env_block_for(
-            stored
-        ) == provider.env_block_for(config)
+        return stored is not None and dict(stored.env) == dict(config.env)
 
     def _add_captured_provider(
         self,
@@ -5537,7 +5535,7 @@ class ClaudeAccountSwitcher:
                 warnings_out=warnings_out,
             )
 
-        previous_block = provider.apply_block(provider.env_block_for(config))
+        previous_block = provider.apply_block(config.env)
         try:
             provider.write_marker(self.backup_dir, target_account, get_timestamp())
             data["activeAccountNumber"] = int(target_account)
@@ -5556,8 +5554,7 @@ class ClaudeAccountSwitcher:
             raise
 
         self._logger.info(
-            "Activated account %s (%s, %s)",
-            target_account, config.label, config.describe_auth(),
+            "Activated account %s (%s)", target_account, config.summary()
         )
         from_ref = (
             account_ref(int(leaving_slot), self.account_email(leaving_slot))

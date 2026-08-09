@@ -364,24 +364,37 @@ provider (it's the live login), the second registers the dormant Claude login
 underneath it. Or configure one from scratch:
 
 ```bash
-cswap add-provider --provider bedrock --region us-east-1 --bearer-token
-cswap add-provider --provider mantle  --region us-east-1 --bearer-token -   # from stdin
-cswap add-provider --provider bedrock --region eu-west-1 --profile my-sso
-cswap add-provider --provider bedrock --region us-west-2 \
-    --access-key-id AKIA... --secret-access-key
-cswap add-provider --provider bedrock --region us-east-1 --environment
-cswap add-provider --provider vertex --set ANTHROPIC_VERTEX_PROJECT_ID=my-proj
+# A Bedrock API key (prompts for the token — it never enters your shell history)
+cswap add-provider --provider bedrock --set AWS_REGION=us-east-1 \
+    --set AWS_BEARER_TOKEN_BEDROCK
+
+# A named AWS profile, including SSO
+cswap add-provider --provider bedrock --set AWS_REGION=eu-west-1 \
+    --set AWS_PROFILE=my-sso
+
+# Static access keys, secret read from stdin
+cswap add-provider --provider bedrock --set AWS_REGION=us-west-2 \
+    --set AWS_ACCESS_KEY_ID=AKIA... --set AWS_SECRET_ACCESS_KEY=-
+
+# Ambient credentials (instance role, SSO session, gcloud ADC): set nothing
+cswap add-provider --provider bedrock --set AWS_REGION=us-east-1
+
+cswap add-provider --provider vertex --set CLOUD_ML_REGION=us-central1 \
+    --set ANTHROPIC_VERTEX_PROJECT_ID=my-proj
 ```
 
-All four `/setup-bedrock` auth methods are supported — a Bedrock API key
-(`--bearer-token`), a named AWS profile including SSO (`--profile`), static access
-keys (`--access-key-id`/`--secret-access-key`, optionally `--session-token`), and
-`--environment` to use whatever the AWS credential chain already resolves. Secrets
-are read from a prompt, or from stdin with `-`, so they stay out of your shell
-history. `--set KEY=VALUE` carries extra provider variables (e.g.
-`ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_BEDROCK_SERVICE_TIER`) and
-`--pin-opus`/`--pin-sonnet`/`--pin-haiku`/`--pin-fable` pin a tier to a provider
-model id. Then switch as usual: `cswap switch 3`.
+A provider account is just a set of environment variables, so `--set KEY=VALUE`
+is the whole interface — the same keys you'd put in `settings.json` yourself, and
+whatever your provider needs (a region for Bedrock, a project id for Vertex, a
+resource for Foundry). All four `/setup-bedrock` auth methods work by setting
+their own variables; there's nothing extra to learn.
+
+`--set KEY` with no value **prompts** for it (hidden for secrets), and `KEY=-`
+reads one line from stdin, so a token never has to appear in argv or your shell
+history. `cswap add-provider --list-variables` prints every variable you can set.
+`--pin-opus`/`--pin-sonnet`/`--pin-haiku`/`--pin-fable` are shorthand for the
+corresponding `ANTHROPIC_DEFAULT_*_MODEL` keys. Then switch as usual:
+`cswap switch 3`.
 
 <details>
 <summary>How it behaves & limitations</summary>

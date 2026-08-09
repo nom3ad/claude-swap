@@ -433,12 +433,17 @@ Examples:
 
 
 def _add_provider_command(argv: list[str]) -> None:
-    """Handle `cswap add-provider --provider … [auth flags]`.
+    """Handle `cswap add-provider --provider NAME [--set KEY=VALUE ...]`.
 
     Registers a third-party provider configuration (Amazon Bedrock, Bedrock/
     Mantle, Google Vertex, Microsoft Foundry) as a managed slot. Pre-dispatched
     before the main parser for the same reason as `alias`: it carries its own
     flag set, which the main parser's mutually-exclusive group cannot hold.
+
+    Deliberately thin: a provider account is an env block, so the CLI collects
+    env variables rather than modelling regions and auth methods. That is what
+    lets one command serve every provider — Vertex takes a project id where
+    Bedrock takes a region, and neither needs its own flag.
 
     `cswap add` captures a provider configuration that is already live in
     settings.json; this is the headless spelling, for a machine where it isn't
@@ -460,19 +465,22 @@ def _add_provider_command(argv: list[str]) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  cswap add-provider --provider bedrock --region us-east-1 --bearer-token -
-  cswap add-provider --provider mantle --region us-east-1 --bearer-token
-  cswap add-provider --provider bedrock --region eu-west-1 --profile my-sso
-  cswap add-provider --provider bedrock --region us-east-1 --environment
-  cswap add-provider --provider vertex --set ANTHROPIC_VERTEX_PROJECT_ID=my-proj
+  cswap add-provider --provider bedrock --set AWS_REGION=us-east-1 \\
+      --set AWS_BEARER_TOKEN_BEDROCK           # prompts for the token
+  cswap add-provider --provider bedrock --set AWS_REGION=eu-west-1 \\
+      --set AWS_PROFILE=my-sso
+  cswap add-provider --provider bedrock --set AWS_REGION=us-west-2 \\
+      --set AWS_ACCESS_KEY_ID=AKIA... --set AWS_SECRET_ACCESS_KEY=-
+  cswap add-provider --provider vertex --set CLOUD_ML_REGION=us-central1 \\
+      --set ANTHROPIC_VERTEX_PROJECT_ID=my-proj
 
-Secrets are read from a prompt (or stdin with '-') rather than argv, so they
-stay out of your shell history.
+--set KEY with no value prompts for it, and KEY=- reads one line from stdin, so
+a secret never has to appear in argv or your shell history.
+Run with --list-variables to see every variable that can be set.
         """,
     )
     parser.add_argument(
         "--provider",
-        required=True,
         metavar="NAME",
         help=(
             "Which provider: bedrock, mantle, vertex, foundry, anthropic-aws, "
@@ -480,72 +488,26 @@ stay out of your shell history.
         ),
     )
     parser.add_argument(
-        "--region",
-        metavar="REGION",
-        help="Region/location for the provider (e.g. us-east-1)",
-    )
-    auth = parser.add_mutually_exclusive_group()
-    auth.add_argument(
-        "--bearer-token",
-        nargs="?",
-        const="",
-        metavar="TOKEN|-",
-        help=(
-            "Bedrock API key (AWS_BEARER_TOKEN_BEDROCK). Pass '-' to read one "
-            "line from stdin, or no value to be prompted securely"
-        ),
-    )
-    auth.add_argument(
-        "--profile",
-        metavar="NAME",
-        help="Named AWS profile to authenticate with (AWS_PROFILE)",
-    )
-    auth.add_argument(
-        "--access-key-id",
-        metavar="ID",
-        help="Static AWS access key id (requires --secret-access-key)",
-    )
-    auth.add_argument(
-        "--environment",
-        action="store_true",
-        help=(
-            "Use the ambient credentials already in the environment (AWS "
-            "provider chain, SSO, instance role, gcloud ADC) — nothing stored"
-        ),
-    )
-    parser.add_argument(
-        "--secret-access-key",
-        nargs="?",
-        const="",
-        metavar="KEY|-",
-        help=(
-            "Static AWS secret access key. Pass '-' to read one line from "
-            "stdin, or no value to be prompted securely"
-        ),
-    )
-    parser.add_argument(
-        "--session-token",
-        nargs="?",
-        const="",
-        metavar="TOKEN|-",
-        help="Optional AWS session token for temporary static credentials",
-    )
-    for tier in provider.MODEL_PIN_KEYS:
-        parser.add_argument(
-            f"--pin-{tier}",
-            metavar="MODEL_ID",
-            help=f"Pin the {tier} tier to a provider model id",
-        )
-    parser.add_argument(
         "--set",
         action="append",
         default=[],
-        metavar="KEY=VALUE",
+        metavar="KEY[=VALUE]",
         dest="env_assignments",
         help=(
-            "Set an additional provider variable (repeatable), e.g. "
-            "--set ANTHROPIC_CUSTOM_HEADERS='anthropic-workspace-id: proj_x'"
+            "Set a provider variable (repeatable). 'KEY' alone prompts for the "
+            "value, 'KEY=-' reads one line from stdin"
         ),
+    )
+    for tier, key in provider.MODEL_PIN_KEYS.items():
+        parser.add_argument(
+            f"--pin-{tier}",
+            metavar="MODEL_ID",
+            help=f"Shorthand for --set {key}=MODEL_ID",
+        )
+    parser.add_argument(
+        "--list-variables",
+        action="store_true",
+        help="List every provider variable that can be set, then exit",
     )
     parser.add_argument(
         "--email",
@@ -562,72 +524,37 @@ stay out of your shell history.
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
+    if args.list_variables:
+        print(bolded("Provider variables you can --set:"))
+        for key in sorted(provider.MANAGED_ENV_KEYS - provider.PROVIDER_FLAGS):
+            note = muted("  (secret: prompted, not echoed)") if key in provider.SECRET_ENV_KEYS else ""
+            print(f"  {key}{note}")
+        print()
+        print(dimmed(
+            "The provider flag itself comes from --provider. Anything not "
+            "listed here must go in settings.json directly: claude-swap only "
+            "manages what it can also remove when you switch away."
+        ))
+        return
+
+    if not args.provider:
+        parser.error("--provider is required")
+
     try:
-        provider_name = provider.normalize_provider(args.provider)
-        spec = provider.PROVIDERS[provider_name]
-
-        # Resolve the auth method from which flag was given. A provider with no
-        # AWS auth axis (Vertex/Foundry) only ever has ambient credentials.
-        if not spec.aws:
-            if args.bearer_token is not None or args.profile or args.access_key_id:
-                parser.error(
-                    f"{spec.label} authenticates through its own ambient "
-                    "credentials; pass provider-specific values with --set "
-                    "instead of an AWS auth flag."
-                )
-            auth_method = "environment"
-        elif args.bearer_token is not None:
-            auth_method = "bearer"
-        elif args.profile:
-            auth_method = "profile"
-        elif args.access_key_id:
-            auth_method = "accessKey"
-        elif args.environment:
-            auth_method = "environment"
-        else:
-            parser.error(
-                "choose how to authenticate: --bearer-token, --profile, "
-                "--access-key-id (with --secret-access-key), or --environment"
-            )
-
-        bearer = (
-            _read_secret(args.bearer_token, "Bedrock API key: ")
-            if auth_method == "bearer"
-            else ""
-        )
-        secret_key = ""
-        session_token = ""
-        if auth_method == "accessKey":
-            if args.secret_access_key is None:
-                parser.error("--access-key-id requires --secret-access-key")
-            secret_key = _read_secret(args.secret_access_key, "Secret access key: ")
-            if args.session_token is not None:
-                session_token = _read_secret(args.session_token, "Session token: ")
-        elif args.secret_access_key is not None or args.session_token is not None:
-            parser.error(
-                "--secret-access-key/--session-token apply to --access-key-id only"
-            )
-
         env: dict[str, str] = {}
         for assignment in args.env_assignments:
             key, value = provider.parse_env_assignment(assignment)
+            if value is None or value == "-":
+                value = _read_env_value(key, from_stdin=value == "-")
             env[key] = value
+        for tier, key in provider.MODEL_PIN_KEYS.items():
+            pinned = getattr(args, f"pin_{tier}")
+            if pinned:
+                env[key] = pinned
 
         config = provider.parse_provider_config({
-            "provider": provider_name,
-            "authMethod": auth_method,
-            "region": args.region or "",
-            "bearerToken": bearer,
-            "awsProfile": args.profile or "",
-            "accessKeyId": args.access_key_id or "",
-            "secretAccessKey": secret_key,
-            "sessionToken": session_token,
+            "provider": args.provider,
             "env": env,
-            "modelPins": {
-                tier: getattr(args, f"pin_{tier}")
-                for tier in provider.MODEL_PIN_KEYS
-                if getattr(args, f"pin_{tier}")
-            },
         })
 
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -645,24 +572,28 @@ stay out of your shell history.
         sys.exit(130)
 
 
-def _read_secret(value: str, prompt: str) -> str:
-    """Resolve a secret flag value: ``-`` reads stdin, ``""`` prompts.
+def _read_env_value(key: str, *, from_stdin: bool = False) -> str:
+    """Resolve a `--set KEY` (no value) or `--set KEY=-` into a value.
 
-    Same contract as ``--add-token``: a secret should not have to appear in
-    argv (and so in shell history), so an empty value prompts via getpass and
-    ``-`` reads one line from stdin for scripted use. A value passed inline is
-    still honored — some callers legitimately have it in an env var already.
+    A secret should not have to appear in argv, and so in shell history: a bare
+    key prompts (hidden for secrets, echoed otherwise, since seeing a region as
+    you type it is helpful), and `-` reads one line from stdin for scripted use.
     """
     import getpass
 
-    if value == "-":
+    from claude_swap import provider
+
+    if from_stdin:
         value = sys.stdin.readline().rstrip("\n")
-    elif not value:
-        value = getpass.getpass(prompt)
+    elif key in provider.SECRET_ENV_KEYS:
+        value = getpass.getpass(f"{key}: ")
+    else:
+        value = input(f"{key}: ")
     value = value.strip()
     if not value:
-        raise ValidationError("Secret cannot be empty")
+        raise ValidationError(f"{key} cannot be empty")
     return value
+
 
 
 def _alias_command(argv: list[str]) -> None:
@@ -1195,7 +1126,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
-  %(prog)s add-provider --provider bedrock --region us-east-1 --bearer-token
+  %(prog)s add-provider --provider bedrock --set AWS_REGION=us-east-1
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
