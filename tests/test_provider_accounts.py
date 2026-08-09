@@ -278,17 +278,6 @@ class TestEnvBlock:
             "AWS_REGION": "us-east-1",
         }
 
-    def test_fingerprint_is_order_independent_and_secret_free(self):
-        a = provider.block_fingerprint({"A": "1", "B": "2"})
-        b = provider.block_fingerprint({"B": "2", "A": "1"})
-        assert a == b
-        assert BEARER not in provider.block_fingerprint(MANTLE_BLOCK)
-
-    def test_redacted_block_masks_secrets_only(self):
-        redacted = provider.redacted_block(MANTLE_BLOCK)
-        assert redacted["AWS_BEARER_TOKEN_BEDROCK"] == "(hidden)"
-        assert redacted["AWS_REGION"] == "us-east-1"
-
 
 class TestValidation:
     """Only two rules, both because breaking them breaks activation itself.
@@ -484,24 +473,18 @@ class TestApplyBlock:
 
 
 class TestActiveSlotResolution:
-    def test_marker_is_verified_not_trusted(self):
+    def test_matches_the_owning_slot(self):
         blocks = {"1": {"A": "1"}, "2": {"B": "2"}}
-        # Marker points at 1 but the live block is 2's: the scan corrects it.
-        assert provider.resolve_active_slot({"B": "2"}, blocks, "1") == "2"
+        assert provider.resolve_active_slot({"B": "2"}, blocks) == "2"
 
-    def test_marker_disambiguates_identical_configs(self):
-        blocks = {"1": {"A": "1"}, "2": {"A": "1"}}
-        assert provider.resolve_active_slot({"A": "1"}, blocks, "2") == "2"
-
-    def test_identical_configs_without_a_marker_are_stable(self):
-        blocks = {"2": {"A": "1"}, "1": {"A": "1"}}
-        assert provider.resolve_active_slot({"A": "1"}, blocks, None) == "1"
+    def test_identical_configs_resolve_to_the_lowest_slot(self):
+        assert provider.resolve_active_slot({"A": "1"}, {"2": {"A": "1"}, "1": {"A": "1"}}) == "1"
 
     def test_unmanaged_live_block_resolves_to_none(self):
-        assert provider.resolve_active_slot({"A": "1"}, {"1": {"B": "2"}}, None) is None
+        assert provider.resolve_active_slot({"A": "1"}, {"1": {"B": "2"}}) is None
 
     def test_empty_live_block_resolves_to_none(self):
-        assert provider.resolve_active_slot({}, {"1": {}}, "1") is None
+        assert provider.resolve_active_slot({}, {"1": {}}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -840,7 +823,6 @@ class TestSwitchAwayFromProvider:
 
         s.remove_account("1", assume_yes=True)
         assert provider.read_live_block() == {}
-        assert provider.read_marker(s.backup_dir) is None
         assert _read_settings()["effortLevel"] == "xhigh"
 
     def test_removing_an_inactive_provider_slot_leaves_the_block(
@@ -875,31 +857,28 @@ class TestSwitchAwayFromProvider:
         assert s.active_provider_slot() == "2"
 
 
-class TestMarker:
-    def test_written_on_activation_and_cleared_on_the_way_out(self, temp_home: Path):
+class TestActiveSlotTracking:
+    def test_follows_the_live_block_with_no_stored_state(self, temp_home: Path):
+        # The block itself says which slot is active, so there is nothing to
+        # keep in sync and nothing to go stale.
         _seed_oauth_login()
         s = _switcher()
         s.add_account()
         s.add_provider_account(_bearer_config())
 
         s.switch_to("2")
-        assert provider.read_marker(s.backup_dir) == "2"
+        assert s.active_provider_slot() == "2"
         s.switch_to("1")
-        assert provider.read_marker(s.backup_dir) is None
+        assert s.active_provider_slot() is None
 
-    def test_a_wrong_marker_self_heals(self, temp_home: Path):
+    def test_survives_a_hand_edited_block(self, temp_home: Path):
         s = _switcher()
         s.add_provider_account(_bearer_config())
         s.switch_to("1")
-        provider.write_marker(s.backup_dir, "9", "2026-01-01T00:00:00Z")
-        # The fingerprint scan still finds the real owner.
-        assert s.active_provider_slot() == "1"
-
-    def test_a_missing_marker_still_resolves(self, temp_home: Path):
-        s = _switcher()
-        s.add_provider_account(_bearer_config())
-        s.switch_to("1")
-        provider.clear_marker(s.backup_dir)
+        provider.apply_block({"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "xx"})
+        # No longer any slot's config — reported unmanaged, repaired by --force.
+        assert s.active_provider_slot() is None
+        s.switch_to("1", force=True)
         assert s.active_provider_slot() == "1"
 
 

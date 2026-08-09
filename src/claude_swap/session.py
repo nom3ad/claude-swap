@@ -512,18 +512,13 @@ class SessionManager:
     def _warn_provider_block_overrides_session(self) -> None:
         """Warn when a live provider config will outrank the session's account.
 
-        A third-party provider is configured in ``settings.json``'s ``env``, and
-        claude applies that over the process environment — while sharing
-        *symlinks* the user's own ``settings.json`` into the profile. So a
-        session launched while a provider account is the default login runs
-        against that provider, billing the cloud account, no matter which
-        account's credential the profile holds. ``CLAUDE_CONFIG_DIR`` cannot
-        isolate this: the block is inside the file being shared.
+        Claude applies ``settings.json``'s ``env`` over the process environment,
+        and sharing *symlinks* that file into the profile — so the session runs
+        against the provider whatever credential the profile holds.
+        ``CLAUDE_CONFIG_DIR`` cannot isolate it (verified against claude 2.1.223).
 
-        Warn rather than block: the user asked for this account, running it
-        against the provider still works, and refusing would strand
-        ``cswap run`` for anyone whose default login is a provider. Best-effort
-        — a warning must never fail a launch.
+        Warn rather than block: the launch still works, and refusing would
+        strand ``cswap run`` for anyone defaulting to a provider.
         """
         try:
             from claude_swap import provider
@@ -547,13 +542,10 @@ class SessionManager:
         """Reject non-OAuth account kinds in session mode (not supported yet).
 
         Session bootstrap is OAuth-shaped — it seeds ``.credentials.json`` and
-        ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so an
-        API-key account would otherwise fail validation opaquely. A third-party
-        provider account fails for a further reason: its configuration is
-        environment, not a credential, and ``CLAUDE_CONFIG_DIR`` does not isolate
-        the ``settings.json`` env block that carries it (sharing symlinks the
-        user's own settings.json into the profile), so a per-session provider
-        would leak into every other terminal. Raise early with guidance.
+        ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so both
+        other kinds would otherwise fail validation opaquely. A provider account
+        also cannot be isolated per-session at all (see
+        ``_warn_provider_block_overrides_session``).
         """
         kind = self.switcher._account_kind(account_num)
         if kind == "api_key":

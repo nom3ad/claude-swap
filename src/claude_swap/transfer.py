@@ -156,11 +156,9 @@ def _slim_credentials(creds_obj: dict) -> dict:
     ``claudeAiOauth`` export verbatim; ``--full`` (same-PC backup) skips
     this and keeps the whole blob.
 
-    A third-party provider config passes through verbatim: every field is
-    load-bearing for activation, so there is nothing separable to drop. Note
-    the security consequence — a ``bearer`` or ``accessKey`` provider account
-    carries its secret into the export even without ``--full``, because that
-    secret *is* the account (see the export docstring).
+    A provider config passes through verbatim: every key is needed to activate
+    it, so there is nothing separable to drop (see the export docstring on the
+    security consequence).
     """
     if provider.looks_like_provider_config(json.dumps(creds_obj)):
         return creds_obj
@@ -186,12 +184,10 @@ def export_accounts(
             False writes only oauthAccount and the account's own
             claudeAiOauth login.
 
-    Third-party provider accounts are exported in full regardless of ``full``:
-    every field of a provider config is needed to activate it, so a ``bearer``
-    or ``accessKey`` account's **secret travels in the export**. (``profile`` and
-    ``environment`` accounts carry no secret — they name ambient AWS credentials
-    that stay on each machine.) The envelope has never been encrypted; this
-    makes protecting it matter more, not differently.
+    Provider accounts export in full regardless of ``full`` — every key is
+    needed to activate them — so an account whose config holds a token or secret
+    key **carries it into the export**. The envelope has never been encrypted;
+    this makes protecting it matter more, not differently.
 
     Raises:
         TransferError: malformed/missing data, unknown account.
@@ -401,10 +397,9 @@ def import_accounts(
         config_obj = raw.get("config")
         if not isinstance(config_obj, dict):
             raise TransferError(f"config for {email} must be a JSON object")
-        # API-key accounts carry the credential as a raw string; OAuth and
-        # third-party provider accounts carry a JSON object (told apart by the
-        # declared kind, falling back to the payload's own shape for an export
-        # written before the kind existed).
+        # API keys are a raw string; OAuth and provider configs are objects,
+        # told apart by the declared kind (falling back to the payload's shape
+        # for an export written before that kind existed).
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
         is_provider = raw.get("kind") == "provider" or (
             raw.get("kind") is None
@@ -417,8 +412,7 @@ def import_accounts(
                 )
             creds_text = creds_obj.strip()
         elif is_provider:
-            # Validate through the one provider validator, so a hand-edited or
-            # future-version export is rejected here rather than at switch time.
+            # Rejected here rather than at switch time.
             try:
                 config = provider.parse_provider_config(
                     creds_obj, label=f"provider credentials for {email}"

@@ -435,19 +435,13 @@ Examples:
 def _add_provider_command(argv: list[str]) -> None:
     """Handle `cswap add-provider --provider NAME [--set KEY=VALUE ...]`.
 
-    Registers a third-party provider configuration (Amazon Bedrock, Bedrock/
-    Mantle, Google Vertex, Microsoft Foundry) as a managed slot. Pre-dispatched
-    before the main parser for the same reason as `alias`: it carries its own
-    flag set, which the main parser's mutually-exclusive group cannot hold.
+    The headless spelling of registering a provider slot; `cswap add` captures
+    one already live in settings.json. Pre-dispatched before the main parser for
+    the same reason as `alias`: it carries its own flag set, which the main
+    parser's mutually-exclusive group cannot hold.
 
-    Deliberately thin: a provider account is an env block, so the CLI collects
-    env variables rather than modelling regions and auth methods. That is what
-    lets one command serve every provider — Vertex takes a project id where
-    Bedrock takes a region, and neither needs its own flag.
-
-    `cswap add` captures a provider configuration that is already live in
-    settings.json; this is the headless spelling, for a machine where it isn't
-    set up yet or where the values come from elsewhere.
+    Collects env variables rather than modelling regions and auth methods, which
+    is what lets one command serve every provider.
     """
     from claude_swap import provider
 
@@ -575,9 +569,8 @@ Run with --list-variables to see every variable that can be set.
 def _read_env_value(key: str, *, from_stdin: bool = False) -> str:
     """Resolve a `--set KEY` (no value) or `--set KEY=-` into a value.
 
-    A secret should not have to appear in argv, and so in shell history: a bare
-    key prompts (hidden for secrets, echoed otherwise, since seeing a region as
-    you type it is helpful), and `-` reads one line from stdin for scripted use.
+    Keeps secrets out of argv (and shell history): a bare key prompts — hidden
+    for secrets, echoed otherwise — and `-` reads stdin for scripted use.
     """
     import getpass
 

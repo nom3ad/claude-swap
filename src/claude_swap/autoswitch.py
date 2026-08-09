@@ -675,12 +675,10 @@ class AutoSwitchEngine:
 
     # -- metered accounts -----------------------------------------------------
     #
-    # Managed API keys and third-party provider accounts (Bedrock/Mantle/Vertex/
-    # Foundry) share every property the engine cares about: they report no quota
-    # to compare, they bill per token rather than against a subscription window,
-    # and neither has a refresh token to freshen. Both are therefore held out of
-    # automatic rotation unless the user opts that kind in — an unattended
-    # failover must not silently start spending money.
+    # API-key and provider accounts look identical to the engine: no quota to
+    # compare, no refresh token to freshen, billed per token. Held out of
+    # rotation unless opted in — an unattended failover must not start spending
+    # money on its own.
 
     def _is_metered(self, number: str) -> bool:
         """Whether a slot bills per token instead of against a quota window."""

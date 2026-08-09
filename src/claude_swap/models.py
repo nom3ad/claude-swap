@@ -199,11 +199,9 @@ class SwitchTransaction:
                     if sys.platform != "win32":
                         os.chmod(self.config_path, 0o600)
                 elif step == "provider_block_written":
-                    # Restoring {} clears the managed keys, which is correct:
-                    # an empty capture means no provider account was active
-                    # before this switch wrote one.
                     from claude_swap import provider
 
+                    # {} correctly clears: no provider was active beforehand.
                     provider.apply_block(self.original_provider_block or {})
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()

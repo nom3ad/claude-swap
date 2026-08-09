@@ -1,50 +1,28 @@
 """Third-party provider accounts: the ``env`` block of ``settings.json``.
 
-Claude Code reaches Anthropic's first-party API with a *credential* (an OAuth
-blob or a managed ``sk-ant-api…`` key), which is what ``credentials.py`` owns.
-It reaches a third-party provider — Amazon Bedrock, Bedrock/Mantle, Google
-Vertex, Microsoft Foundry — with no credential at all: the whole configuration
-is **environment variables**, and Claude Code's own ``/setup-bedrock`` wizard
-persists them into the ``env`` object of ``<config-home>/settings.json``.
-
-So a provider account here *is* an env dict. Nothing models AWS auth methods,
-regions, or model pins as fields: those are just keys, and keeping them keys is
-what lets one code path serve every provider (Vertex takes a project id where
-Bedrock takes a region; Foundry takes neither). Activation writes the dict;
-capture reads it back. There is no translation layer to get wrong.
+Claude Code reaches a third-party provider (Amazon Bedrock, Bedrock/Mantle,
+Google Vertex, Microsoft Foundry) with no credential at all — the whole
+configuration is environment variables, which ``/setup-bedrock`` persists into
+the ``env`` object of ``<config-home>/settings.json``. So a provider account
+here *is* an env dict: activation writes it, capture reads it back.
 
 Verified against the claude 2.1.223 bundle:
 
-- The provider is chosen by a boolean flag env var, resolved in a fixed order
-  (``Mn()``): ``CLAUDE_CODE_USE_BEDROCK`` → bedrock, ``…_FOUNDRY`` → foundry,
-  ``…_ANTHROPIC_AWS``, ``…_ANTHROPIC_GOOGLE_CLOUD``, ``…_USE_MANTLE`` → mantle,
-  ``…_USE_VERTEX`` → vertex. First flag set wins; see ``PROVIDER_ORDER``.
-- AWS auth resolves in a fixed precedence: ``AWS_BEARER_TOKEN_BEDROCK`` (sent as
-  ``Authorization: Bearer …``), else the static-key trio, else the ambient AWS
-  provider chain (which honors ``AWS_PROFILE``, SSO, IMDS). cswap does not need
-  to know this — it stores whichever keys the user set — but it is why the
-  clear-set below is not optional.
-- The wizard's env writer (``tff``) sets every key it does *not* need to
-  ``undefined``, so changing provider or auth method removes the previous one's
-  keys. :data:`MANAGED_ENV_KEYS` is that same clear-set: activation deletes all
-  of them before writing the new account's, or a leftover
-  ``AWS_BEARER_TOKEN_BEDROCK`` would silently outrank a freshly activated
-  static-key account.
+- The active provider is the first flag in :data:`PROVIDER_ORDER` that is set
+  (claude's ``Mn()``).
+- The wizard's env writer (``tff``) sets every key it does not need to
+  ``undefined``. :data:`MANAGED_ENV_KEYS` is that clear-set: activation removes
+  all of them before writing the new account's, or a leftover
+  ``AWS_BEARER_TOKEN_BEDROCK`` would outrank a freshly activated static-key
+  account.
 
-This module is the single owner of the ``settings.json`` splice. It is
-deliberately a **leaf**: it imports only ``paths``/``settings``/``claude_locks``/
-``exceptions`` and never the switcher, mirroring how ``credentials.py`` stays a
-leaf collaborator.
-
-Third-party accounts have no server identity, no refresh token, and no
-subscription-quota endpoint, so nothing here talks to the network.
+A leaf module — imports only ``paths``/``settings``/``claude_locks``/
+``exceptions``, never the switcher. Nothing here touches the network.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -54,26 +32,19 @@ from claude_swap.exceptions import ConfigError, ValidationError
 from claude_swap.paths import get_claude_config_home
 from claude_swap.settings import atomic_write_json
 
-_logger = logging.getLogger("claude-swap")
-
-#: Bumped only on a breaking change to the stored provider-config shape.
 PROVIDER_CONFIG_VERSION = 1
 
 
 @dataclass(frozen=True)
 class ProviderSpec:
-    """One third-party provider: its flag env var and its display label.
-
-    ``label`` is copied verbatim from the bundle's provider label map so cswap
-    names a provider the way Claude Code's own UI does.
-    """
+    """A provider's flag env var and its display label (as claude spells it)."""
 
     flag: str
     label: str
 
 
-#: Providers in Claude Code's own resolution order (``Mn()``). A block with more
-#: than one flag set resolves to the first entry here, exactly as claude does.
+#: In claude's own resolution order (``Mn()``), so a block with several flags
+#: set is read the way claude would run it.
 PROVIDERS: dict[str, ProviderSpec] = {
     "bedrock": ProviderSpec("CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"),
     "foundry": ProviderSpec("CLAUDE_CODE_USE_FOUNDRY", "Microsoft Foundry"),
@@ -88,10 +59,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
 }
 
 PROVIDER_ORDER = tuple(PROVIDERS)
+PROVIDER_FLAGS = frozenset(spec.flag for spec in PROVIDERS.values())
 
-#: CLI-friendly spellings accepted for a provider name, folded to the internal
-#: id. Users type ``--provider anthropic-aws``; the stored config keeps claude's
-#: own camelCase id so a config and a bundle string are directly comparable.
+#: Accepted CLI spellings, folded to the internal id.
 _PROVIDER_ALIASES = {
     "anthropic-aws": "anthropicAws",
     "anthropic_aws": "anthropicAws",
@@ -100,26 +70,25 @@ _PROVIDER_ALIASES = {
     "google-cloud": "anthropicGoogleCloud",
 }
 
-PROVIDER_FLAGS = frozenset(spec.flag for spec in PROVIDERS.values())
+#: Model pins, keyed as ``--pin-<tier>`` names them.
+MODEL_PIN_KEYS = {
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+}
 
-# -- the managed env keys ---------------------------------------------------
-#
-# Everything cswap owns inside settings.json's ``env``. Activation clears all of
-# these before writing an account's own keys (see the module docstring on why a
-# partial write is unsafe), so a key that belongs to a provider config MUST be
-# listed here or switching away from that account would leave it live. That is
-# also why ``--set`` refuses an unlisted key rather than passing it through.
-#
-# Grouped by what they configure, purely for reading; the union is what matters.
-
-_REGION_KEYS = frozenset({
+#: Everything cswap owns inside ``settings.json``'s ``env``, and therefore
+#: everything it clears when switching away. A key not listed here would be
+#: written on activation and never removed, outliving its account — which is why
+#: ``--set`` refuses one rather than passing it through.
+MANAGED_ENV_KEYS: frozenset[str] = PROVIDER_FLAGS | frozenset({
+    # region / location
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
     "CLOUD_ML_REGION",
     "ANTHROPIC_GOOGLE_CLOUD_LOCATION",
-})
-
-_AUTH_KEYS = frozenset({
+    # credentials
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_PROFILE",
     "AWS_ACCESS_KEY_ID",
@@ -131,20 +100,12 @@ _AUTH_KEYS = frozenset({
     "ANTHROPIC_FOUNDRY_API_KEY",
     "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
     "GOOGLE_APPLICATION_CREDENTIALS",
-})
-
-#: Per-tier model pins, keyed the way ``--pin-<tier>`` and the wizard name them.
-MODEL_PIN_KEYS = {
-    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
-}
-
-_ENDPOINT_KEYS = frozenset({
+    # model selection
+    *MODEL_PIN_KEYS.values(),
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+    # endpoints / project scoping
     "ANTHROPIC_CUSTOM_HEADERS",
     "ANTHROPIC_BEDROCK_BASE_URL",
     "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
@@ -165,17 +126,7 @@ _ENDPOINT_KEYS = frozenset({
     "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
 })
 
-MANAGED_ENV_KEYS: frozenset[str] = (
-    PROVIDER_FLAGS
-    | _REGION_KEYS
-    | _AUTH_KEYS
-    | frozenset(MODEL_PIN_KEYS.values())
-    | _ENDPOINT_KEYS
-)
-
-#: Managed keys whose value is a secret: masked in every display surface,
-#: prompted for rather than taken from argv, and called out when exporting.
-#: Mirrors the bundle's own hidden-value set.
+#: Prompted for rather than taken from argv, and flagged when exporting.
 SECRET_ENV_KEYS = frozenset({
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_SECRET_ACCESS_KEY",
@@ -185,17 +136,9 @@ SECRET_ENV_KEYS = frozenset({
     "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
 })
 
-#: Filename of the marker recording which slot the live block came from.
-ACTIVE_MARKER_FILENAME = "active-provider.json"
-
 
 def normalize_provider(name: str) -> str:
-    """Fold a user-supplied provider name to its internal id.
-
-    Accepts the internal ids, their kebab/snake spellings, and any casing.
-    Raises :class:`ValidationError` listing the valid names — the CLI, capture,
-    and import all resolve names through here so they reject identically.
-    """
+    """Fold a provider name to its internal id, or raise listing the valid ones."""
     raw = (name or "").strip()
     if not raw:
         raise ValidationError(
@@ -216,14 +159,11 @@ def normalize_provider(name: str) -> str:
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    """A third-party provider configuration: a provider id and an env block.
+    """A provider id plus the env block that activates it.
 
-    The ``env`` mapping is exactly what gets written into ``settings.json`` (the
-    provider flag included), so activation is a copy and capture is a read.
-
-    Stored through the ordinary per-account credential store, so it inherits the
-    0600 ``.enc`` files, the macOS Keychain backend, and ``.prev`` retention —
-    for a bearer-token or access-key account it *is* secret material.
+    Stored through the ordinary per-account credential store, so it inherits its
+    0600 files and macOS Keychain backend — for a bearer-token or access-key
+    account the block *is* secret material.
     """
 
     provider: str
@@ -231,16 +171,10 @@ class ProviderConfig:
 
     @property
     def label(self) -> str:
-        """Human provider name, as Claude Code's own UI spells it."""
         return PROVIDERS[self.provider].label
 
     def summary(self) -> str:
-        """One-line description: the label plus the keys it sets.
-
-        Names keys rather than interpreting them — cswap deliberately does not
-        model what "bearer auth" is, so it reports what is configured and lets
-        the key names speak. Secret values are never included.
-        """
+        """The label plus the keys it sets — never their values."""
         keys = sorted(set(self.env) - PROVIDER_FLAGS)
         return f"{self.label} — {', '.join(keys)}" if keys else self.label
 
@@ -256,12 +190,11 @@ class ProviderConfig:
 
 
 def looks_like_provider_config(credentials: str | None) -> bool:
-    """Whether a stored credential blob is a provider config rather than a login.
+    """Whether a stored credential blob is a provider config, not a login.
 
-    Strict on purpose, and checked the same way everywhere a stored blob's kind
-    has to be told from its bytes (export, import, capture): a provider config
-    is a JSON object carrying a recognized ``provider``. An OAuth blob has none,
-    and a raw API key is not JSON at all.
+    How every path (export, import, capture, usage sentinel) tells the kinds
+    apart from bytes alone: an OAuth blob has no ``provider``, a raw API key is
+    not JSON.
     """
     if not credentials:
         return False
@@ -278,21 +211,13 @@ def looks_like_provider_config(credentials: str | None) -> bool:
 def parse_provider_config(
     data: object, *, label: str = "provider config"
 ) -> ProviderConfig:
-    """Validate a provider config (dict or JSON text) into a ProviderConfig.
+    """Validate a provider config (dict or JSON text). The one chokepoint.
 
-    The single validation chokepoint: the CLI, live capture, and import all come
-    through here, so a malformed config is rejected identically wherever it
-    enters. Two things are checked, both because getting them wrong would break
-    activation rather than merely inconvenience the user:
-
-    - The provider must be one claude knows (it supplies the flag to set).
-    - Every ``env`` key must be in :data:`MANAGED_ENV_KEYS`, so it can also be
-      *cleared* when switching away (see :func:`_validated_env_key`).
-
-    Whether the keys form a working configuration is deliberately NOT checked:
-    the provider decides that, cswap would only be guessing, and a wrong guess
-    would refuse a valid setup. A missing region or revoked token surfaces on
-    the first request, exactly as it would after ``/setup-bedrock``.
+    Checks only what would break activation: a provider claude knows, and keys
+    cswap can also clear. Whether the keys form a *working* configuration is the
+    provider's call — guessing here would refuse valid setups (an instance role,
+    a credential file, an ambient chain), and a bad region or revoked token
+    surfaces on the first request either way.
     """
     if isinstance(data, str):
         try:
@@ -308,25 +233,19 @@ def parse_provider_config(
     if not isinstance(raw_env, dict):
         raise ValidationError(f"{label}: env must be a JSON object")
     env = {
-        _validated_env_key(key, label): _validated_env_value(key, value, label)
+        validated_env_key(key, label): _validated_env_value(key, value, label)
         for key, value in raw_env.items()
-        # Flags are re-derived from ``provider`` below, so a stored one is
-        # redundant rather than wrong — drop it instead of rejecting the whole
-        # config (which would make every config fail its own round trip).
+        # A stored flag is redundant, not wrong — dropping it keeps parse
+        # idempotent so a config survives its own round trip.
         if str(key).strip() not in PROVIDER_FLAGS
     }
-    # The flag comes from the provider id, so a config cannot contradict itself.
-    env = {PROVIDERS[provider].flag: "1", **env}
-    return ProviderConfig(provider=provider, env=env)
+    return ProviderConfig(
+        provider=provider, env={PROVIDERS[provider].flag: "1", **env}
+    )
 
 
-def _validated_env_key(key: object, label: str) -> str:
-    """Accept only a key cswap can also *clear* on the way out.
-
-    An unmanaged key would be written on activation and then left behind
-    forever, since :data:`MANAGED_ENV_KEYS` is what the clear-set iterates —
-    it would outlive its account and leak into every other one.
-    """
+def validated_env_key(key: object, label: str) -> str:
+    """Accept only a key cswap can also clear (see :data:`MANAGED_ENV_KEYS`)."""
     name = str(key).strip()
     if name not in MANAGED_ENV_KEYS:
         raise ValidationError(
@@ -346,40 +265,30 @@ def _validated_env_value(key: object, value: object, label: str) -> str:
 def parse_env_assignment(assignment: str) -> tuple[str, str | None]:
     """Parse one ``--set`` argument into ``(key, value | None)``.
 
-    ``None`` means no value was given inline, which the CLI turns into a prompt
-    (or a stdin read for ``KEY=-``) so a secret need never appear in argv or
-    shell history. The key is validated here either way.
+    ``None`` means no inline value, which the CLI turns into a prompt, so a
+    secret need never appear in argv.
     """
     key, sep, value = assignment.partition("=")
     name = str(key).strip()
     if name in PROVIDER_FLAGS:
-        # Unlike a stored config (where the flag is redundant), setting it by
-        # hand contradicts --provider — which is the flag's only source.
         raise ValidationError(
             f"--set: '{name}' is set from the provider itself; pass "
             "--provider instead of setting the flag."
         )
-    name = _validated_env_key(name, "--set")
+    name = validated_env_key(name, "--set")
     if not sep:
         return name, None
     return name, _validated_env_value(name, value, "--set")
 
 
 def config_from_block(block: Mapping[str, str]) -> ProviderConfig | None:
-    """Read a provider config out of a live env block; ``None`` when inactive.
+    """The provider config a live env block represents; ``None`` if inactive.
 
-    Resolution mirrors claude's ``Mn()``: the first flag in
-    :data:`PROVIDER_ORDER` whose value is truthy wins, so a block with several
-    flags is read exactly as claude would run it. Everything else in the block
-    is carried verbatim — capture stores what is live rather than re-deriving
-    what it means.
+    Carries every key verbatim: which one claude authenticates with is claude's
+    business, so a captured config keeps behaving exactly as it did.
     """
     provider = next(
-        (
-            name
-            for name in PROVIDER_ORDER
-            if _truthy(block.get(PROVIDERS[name].flag))
-        ),
+        (n for n in PROVIDER_ORDER if _truthy(block.get(PROVIDERS[n].flag))),
         None,
     )
     if provider is None:
@@ -394,58 +303,29 @@ def config_from_block(block: Mapping[str, str]) -> ProviderConfig | None:
 
 
 def _truthy(value: object) -> bool:
-    """Claude's ``tr()``: a var counts as set unless it is empty/0/false."""
+    """Claude's ``tr()``: set unless empty/0/false."""
     if value is None:
         return False
     return str(value).strip().lower() not in ("", "0", "false")
-
-
-def block_fingerprint(block: Mapping[str, str]) -> str:
-    """Stable digest of an env block, for matching a live block to a slot.
-
-    Order-independent and secret-free (a digest, never the values), so it can
-    be logged and compared without exposing a bearer token.
-    """
-    canonical = json.dumps(
-        {k: block[k] for k in sorted(block)}, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-
-
-def redacted_block(block: Mapping[str, str]) -> dict[str, str]:
-    """A display copy of a block with every secret value masked."""
-    return {
-        key: ("(hidden)" if key in SECRET_ENV_KEYS else value)
-        for key, value in block.items()
-    }
 
 
 # -- the settings.json splice ----------------------------------------------
 
 
 def settings_path() -> Path:
-    """Claude Code's user-scope ``settings.json`` (``userSettings``).
+    """Claude Code's user-scope ``settings.json``.
 
-    ``<config-home>/settings.json``, where config home follows
-    ``CLAUDE_CONFIG_DIR`` — the same resolution
-    :func:`paths.get_claude_config_home` implements and claude's own ``fct()``
-    performs. Deliberately env-following, like the active credential store:
-    both describe "the login this environment runs as".
+    Follows ``CLAUDE_CONFIG_DIR`` like the active credential store: both
+    describe "the login this environment runs as".
     """
     return get_claude_config_home() / "settings.json"
-
-
-def _settings_lock_dir() -> Path:
-    path = settings_path()
-    return path.parent / (path.name + ".lock")
 
 
 def _load_settings_for_write() -> dict:
     """Read settings.json for a read-modify-write; a corrupt file raises.
 
-    Mirrors ``settings._read_raw_for_write``: degrading a malformed (and maybe
-    hand-recoverable) settings file to ``{}`` would replace the user's whole
-    configuration with a provider block.
+    Degrading to ``{}`` would replace the user's whole configuration with a
+    provider block.
     """
     path = settings_path()
     try:
@@ -470,12 +350,7 @@ def _load_settings_for_write() -> dict:
 
 
 def _managed_only(env: Mapping[str, object]) -> dict[str, str]:
-    """The managed, usable subset of an ``env`` mapping.
-
-    Only string values count: claude coerces its env values from JSON, and a
-    non-string there is a hand-edit cswap should report as absent rather than
-    pretend to understand.
-    """
+    """The managed, string-valued subset of an ``env`` mapping."""
     return {
         key: value
         for key, value in env.items()
@@ -484,10 +359,9 @@ def _managed_only(env: Mapping[str, object]) -> dict[str, str]:
 
 
 def read_live_block() -> dict[str, str]:
-    """The managed env keys currently set in ``settings.json``.
+    """The managed env keys currently set in ``settings.json``, or ``{}``.
 
-    ``{}`` when the file is missing, unreadable, malformed, or simply has no
-    managed keys — a read must never raise into a status/list render.
+    Never raises: this feeds status and list renders.
     """
     try:
         data = json.loads(settings_path().read_text(encoding="utf-8"))
@@ -507,29 +381,23 @@ def live_provider_config() -> ProviderConfig | None:
 def apply_block(block: Mapping[str, str]) -> dict[str, str]:
     """Make ``block`` the managed portion of ``settings.json``'s ``env``.
 
-    Replaces the managed keys wholesale — every key in
-    :data:`MANAGED_ENV_KEYS` not present in ``block`` is deleted — and leaves
-    every other setting and every unmanaged env key untouched. Returns the
-    managed block that was live *before* the write, so a caller can restore it
-    on rollback (and so a no-op write can be detected).
+    Replaces the managed keys wholesale — any not in ``block`` are deleted —
+    leaving other settings and unmanaged env keys untouched. Returns the managed
+    block that was live before, so a caller can restore it on rollback.
 
-    Two correctness properties, both borrowed rather than re-derived:
-
-    - Held under a ``settings.json.lock`` taken with :func:`proper_lockfile`,
-      the same directory-mutex protocol Claude Code uses, so an in-session
-      ``/config`` write cannot interleave with the splice.
-    - Written with :func:`settings.atomic_write_json`, which writes *through* a
-      symlinked path instead of renaming over it (#192/#193). A dotfiles-managed
-      ``~/.claude/settings.json`` is common, and detaching that link would
-      silently strand every later change.
+    Held under Claude Code's own ``settings.json.lock`` protocol so an
+    in-session ``/config`` write cannot interleave, and written with
+    ``atomic_write_json``, which writes *through* a symlink rather than
+    detaching it (#192/#193) — a dotfiles-managed settings.json is common.
     """
-    with proper_lockfile(_settings_lock_dir()):
+    path = settings_path()
+    with proper_lockfile(path.parent / (path.name + ".lock")):
         data = _load_settings_for_write()
         env = data.get("env")
         if env is not None and not isinstance(env, dict):
             raise ConfigError(
-                f"{settings_path()}: 'env' is not a JSON object; fix it "
-                "before switching to a third-party provider account"
+                f"{path}: 'env' is not a JSON object; fix it before "
+                "switching to a third-party provider account"
             )
         env = dict(env or {})
         previous = _managed_only(env)
@@ -539,10 +407,8 @@ def apply_block(block: Mapping[str, str]) -> dict[str, str]:
         if env:
             data["env"] = env
         else:
-            # Claude Code strips default-valued keys; match it so clearing the
-            # last provider leaves settings.json as it was beforehand.
-            data.pop("env", None)
-        atomic_write_json(settings_path(), data)
+            data.pop("env", None)  # claude strips default-valued keys; match it
+        atomic_write_json(path, data)
         return previous
 
 
@@ -551,75 +417,23 @@ def clear_block() -> dict[str, str]:
     return apply_block({})
 
 
-# -- the active-slot marker ------------------------------------------------
-
-
-def marker_path(backup_root: Path) -> Path:
-    return backup_root / ACTIVE_MARKER_FILENAME
-
-
-def read_marker(backup_root: Path) -> str | None:
-    """Slot recorded as the source of the live block, if any.
-
-    A hint only — :func:`resolve_active_slot` verifies it by fingerprint and
-    falls back to scanning, so a stale or hand-deleted marker degrades to a
-    slower answer rather than a wrong one.
-    """
-    try:
-        data = json.loads(marker_path(backup_root).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    slot = data.get("slot")
-    return str(slot) if isinstance(slot, (str, int)) and str(slot) else None
-
-
-def write_marker(backup_root: Path, slot: str, applied_at: str) -> None:
-    """Record which slot the live block came from (best-effort).
-
-    Never raises: the marker is a disambiguation hint, and losing it only costs
-    a fingerprint scan. Failing an otherwise-complete switch over it would be
-    the worse trade.
-    """
-    try:
-        atomic_write_json(
-            marker_path(backup_root),
-            {"schemaVersion": 1, "slot": str(slot), "appliedAt": applied_at},
-        )
-    except Exception as e:  # pragma: no cover - best-effort
-        _logger.warning("Could not record the active provider slot: %s", e)
-
-
-def clear_marker(backup_root: Path) -> None:
-    """Drop the marker (best-effort) — no provider account is active."""
-    try:
-        marker_path(backup_root).unlink(missing_ok=True)
-    except OSError as e:  # pragma: no cover - best-effort
-        _logger.warning("Could not clear the active provider marker: %s", e)
-
-
 def resolve_active_slot(
     live_block: Mapping[str, str],
     slot_blocks: Mapping[str, Mapping[str, str]],
-    marker_slot: str | None,
 ) -> str | None:
-    """Which managed slot the live block is, or ``None`` when it is unmanaged.
+    """Which managed slot the live block belongs to, or ``None`` if unmanaged.
 
-    Fingerprint equality, not value comparison, so the match never handles a
-    secret. The marker is consulted first and *verified*; a disagreement falls
-    through to a scan, which makes an incorrect marker self-healing. Identical
-    configs in two slots resolve to the marked one, then to the lowest slot
-    number, so the answer is at least stable across calls.
+    Two slots holding an identical block are indistinguishable; the lowest wins
+    so the answer is at least stable.
     """
     if not live_block:
         return None
-    live = block_fingerprint(live_block)
-    if marker_slot is not None:
-        candidate = slot_blocks.get(marker_slot)
-        if candidate is not None and block_fingerprint(candidate) == live:
-            return marker_slot
-    for slot in sorted(slot_blocks, key=lambda s: (len(s), s)):
-        if block_fingerprint(slot_blocks[slot]) == live:
-            return slot
-    return None
+    live = dict(live_block)
+    return next(
+        (
+            slot
+            for slot in sorted(slot_blocks, key=lambda s: (len(s), s))
+            if dict(slot_blocks[slot]) == live
+        ),
+        None,
+    )
